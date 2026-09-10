@@ -1,0 +1,31 @@
+# VCS
+.git/
+.gitignore
+.github/
+
+# Local tooling and editor state
+.idea/
+.vscode/
+.claude/
+CLAUDE.local.md
+
+# Secrets and local environment
+.env
+.env.*
+
+# Build artifacts and coverage
+bin/
+dist/
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Docs and compose (not needed in the image build context)
+docs/
+README.md
+CONTRIBUTING.md
+SECURITY.md
+CODE_OF_CONDUCT.md
+LICENSE
+docker-compose.yml

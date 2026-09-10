@@ -1,0 +1,35 @@
+# Build artifacts
+bin/
+dist/
+*.exe
+*.test
+*.out
+
+# Coverage
+coverage.out
+coverage.html
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# Internal working docs (specs, plans, notes — not for the public repo)
+docs/internal/
+
+# Claude Code local context and settings (personal, not for the public repo)
+CLAUDE.local.md
+.claude/
