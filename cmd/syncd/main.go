@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -58,6 +59,20 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Binding before serving turns a busy or invalid address into a startup
+	// error instead of a failure reported from a background goroutine.
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.HTTPAddr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
+	}
+
+	return serve(ctx, ln, cfg, log)
+}
+
+// serve runs the control API on ln until ctx is cancelled or the server fails.
+// On cancellation it stops accepting connections and lets in-flight requests
+// finish for up to cfg.ShutdownTimeout. serve takes ownership of ln.
+func serve(ctx context.Context, ln net.Listener, cfg *config.Config, log *zap.Logger) error {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -65,7 +80,6 @@ func run() error {
 	)
 
 	srv := &http.Server{
-		Addr:              cfg.HTTPAddr,
 		Handler:           api.NewServer(log, reg, cfg.ObjectNames()).Handler(),
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
@@ -76,24 +90,25 @@ func run() error {
 	// Run the HTTP server and surface its error through a channel.
 	serverErr := make(chan error, 1)
 	go func() {
-		log.Info("http server listening", zap.String("addr", cfg.HTTPAddr))
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Info("http server listening", zap.String("addr", ln.Addr().String()))
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
 	}()
 
 	select {
 	case err := <-serverErr:
-		return err
+		return fmt.Errorf("http server: %w", err)
 	case <-ctx.Done():
 		log.Info("shutdown signal received, draining")
 	}
 
-	// Graceful shutdown: stop accepting new requests, let in-flight finish.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	// ctx is already cancelled, so draining needs a context that keeps its
+	// values but drops the cancellation, bounded by its own deadline.
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return err
+		return fmt.Errorf("graceful shutdown: %w", err)
 	}
 	log.Info("shutdown complete")
 	return nil

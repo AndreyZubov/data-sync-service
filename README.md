@@ -1,7 +1,6 @@
 # Salesforce Bulk Data Sync Service
 
 [![CI](https://github.com/AndreyZubov/data-sync-service/actions/workflows/ci.yml/badge.svg)](https://github.com/AndreyZubov/data-sync-service/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/AndreyZubov/data-sync-service.svg)](https://pkg.go.dev/github.com/AndreyZubov/data-sync-service)
 [![Go Report Card](https://goreportcard.com/badge/github.com/AndreyZubov/data-sync-service)](https://goreportcard.com/report/github.com/AndreyZubov/data-sync-service)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -67,7 +66,7 @@ shutdown across all goroutines.
 
 ### Prerequisites
 
-- Go 1.26 or newer.
+- Go 1.26.3 or newer (the version in `go.mod`).
 - Docker — used for the local Postgres container and for `golangci-lint`.
 - A Salesforce Developer Edition org or sandbox with a connected app configured
   for the OAuth client-credentials flow (only needed once the pipelines land).
@@ -88,7 +87,20 @@ curl localhost:8080/readyz    # readiness
 curl localhost:8080/metrics   # Prometheus metrics
 ```
 
+To run the service in a container next to Postgres instead, use
+`make compose-app`; `make compose-down` stops everything.
+
 `make help` lists every target.
+
+### Released builds
+
+Tagged releases publish `linux` and `darwin` binaries for `amd64` and `arm64` on the
+[releases page](https://github.com/AndreyZubov/data-sync-service/releases), and a
+multi-arch image with SBOM and provenance attestations:
+
+```bash
+docker run --rm -p 8080:8080 --env-file .env ghcr.io/andreyzubov/data-sync-service:<version>
+```
 
 ---
 
@@ -175,11 +187,12 @@ Each `SYNC_OBJECTS` entry is `Object:cron`:
 ```
 cmd/syncd/            entry point
 internal/
-  api/                chi router, control and health endpoints
+  api/                chi router, middleware, control and health endpoints
   config/             environment configuration loader and validation
   logging/            zap logger constructor
 scripts/hooks/        git pre-commit hook
-.github/workflows/    CI: lint, tidy check, tests, govulncheck, image build
+.github/workflows/    CI, CodeQL, and the tag-triggered release
+.goreleaser.yaml      release binaries and checksums
 ```
 
 ---
@@ -194,8 +207,10 @@ make cover           # tests plus an HTML coverage report
 make lint            # go vet + golangci-lint (via Docker)
 make fmt             # gofumpt + gci import ordering
 make config-verify   # validate .golangci.yml against the linter schema
+make vuln            # govulncheck against dependencies and the standard library
 make install-hooks   # pre-commit hook running lint and tests
 make docker-build    # build the container image
+make compose-app     # run the service and Postgres in containers
 ```
 
 `golangci-lint` runs from a pinned Docker image, so no local installation is
@@ -204,7 +219,16 @@ needed and CI uses the same build. Linters enabled include `errcheck`, `gosec`,
 formatting is `gofumpt` plus `gci` import grouping.
 
 CI runs lint, a `go mod tidy` cleanliness check, tests under the race detector
-with a coverage summary, `govulncheck`, and a Docker image build.
+with a coverage summary, `govulncheck`, and a Docker image build; CodeQL analyses
+every push and pull request. Actions are pinned to commit SHAs, and Dependabot keeps
+them current.
+
+### Releasing
+
+Pushing a tag such as `v0.1.0` runs the release workflow: tests, then GoReleaser
+publishes the GitHub release with binaries and checksums, and the container image
+is pushed to `ghcr.io`. Move the `Unreleased` entries in
+[CHANGELOG.md](CHANGELOG.md) under the new version before tagging.
 
 ---
 

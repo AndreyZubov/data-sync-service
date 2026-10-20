@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
 
 # --- build stage ---
-FROM golang:1.26 AS build
+# Runs on the build host's architecture and cross-compiles for the target, which
+# is far faster than building under QEMU emulation for multi-arch images.
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 WORKDIR /src
 
 # Cache dependencies first so source edits do not invalidate the download layer.
@@ -11,7 +13,9 @@ RUN go mod download
 COPY . .
 
 ARG VERSION=dev
-RUN CGO_ENABLED=0 GOOS=linux go build \
+ARG TARGETOS=linux
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
         -ldflags="-s -w -X main.version=${VERSION}" \
         -o /out/syncd ./cmd/syncd
 

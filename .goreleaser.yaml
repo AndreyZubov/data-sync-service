@@ -1,0 +1,42 @@
+# GoReleaser configuration: builds release binaries and publishes the GitHub
+# release when a v*.*.* tag is pushed (see .github/workflows/release.yml).
+version: 2
+
+project_name: data-sync-service
+
+builds:
+  - id: syncd
+    main: ./cmd/syncd
+    binary: syncd
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    # The full tag (v1.2.3) matches what `make build` and the container image report.
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+release:
+  prerelease: auto

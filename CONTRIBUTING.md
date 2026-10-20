@@ -29,9 +29,12 @@ make lint    # go vet + golangci-lint
 make test    # go test ./... -race
 ```
 
-CI runs the same checks plus `go mod tidy` verification, `govulncheck`, and a
-Docker image build. The pre-commit hook installed by `make install-hooks` runs
+CI runs the same checks plus `go mod tidy` verification, `govulncheck`
+(`make vuln` locally), CodeQL, and a Docker image build. The pre-commit hook installed by `make install-hooks` runs
 lint and tests on any commit touching Go code.
+
+User-visible changes get an entry under `Unreleased` in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Code style
 
