@@ -10,9 +10,9 @@
 > jobs, manages async job lifecycles, respects org API limits, and recovers cleanly
 > from failures.
 
-**Status:** early development. The service skeleton runs — configuration, structured
-logging, the chi control API with health and metrics endpoints, graceful shutdown,
-a multi-stage Docker build, and CI. The sync pipelines themselves are the roadmap
+**Status:** early development. The service skeleton runs — validated configuration,
+structured request logging, the chi control API with health and metrics endpoints,
+graceful shutdown, a multi-stage Docker build, and CI. The sync pipelines themselves are the roadmap
 below, and the `/sync/...` routes answer `501 Not Implemented` until they land.
 
 ---
@@ -103,25 +103,56 @@ curl localhost:8080/metrics   # Prometheus metrics
 | `GET`  | `/readyz`               | Readiness                      |
 | `GET`  | `/metrics`              | Prometheus metrics             |
 
+`{object}` must be one of the objects listed in `SYNC_OBJECTS`; it is matched
+case-insensitively, as Salesforce API names are. Any other value is answered with
+`404 Not Found` before it can reach SOQL or SQL. Requests are bounded by a 60-second
+handler timeout, after which the client receives `504 Gateway Timeout`.
+
+Every request is logged as one structured entry carrying the request ID, route
+pattern, status, response size, and duration. Server errors are logged at `error`,
+successful health and metrics probes at `debug`, everything else at `info`.
+
+`/metrics` exposes Go runtime and process collectors plus:
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `http_requests_total` | `method`, `route`, `status` | Control API requests |
+| `http_request_duration_seconds` | `method`, `route` | Control API request latency |
+
+The `route` label is the route pattern (for example `/runs/{id}`), and requests that
+match no route share the `unmatched` label, so client-supplied paths never create new
+time series.
+
 ---
 
 ## Configuration
 
 Configuration comes from the environment only. See [`.env.example`](.env.example).
+It is validated at startup; the service refuses to start and lists every invalid
+value at once.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `HTTP_ADDR` | `:8080` | Control API listen address |
+| `SHUTDOWN_TIMEOUT` | `15s` | How long in-flight requests may drain after `SIGINT`/`SIGTERM`; a Go duration, must be positive |
 | `SF_CLIENT_ID` | — | Connected app consumer key |
 | `SF_CLIENT_SECRET` | — | Connected app consumer secret |
-| `SF_LOGIN_URL` | — | `https://login.salesforce.com` (prod) or `https://test.salesforce.com` (sandbox) |
+| `SF_LOGIN_URL` | — | `https://login.salesforce.com` (prod) or `https://test.salesforce.com` (sandbox); must be an absolute `https` URL |
 | `SF_API_VERSION` | `60.0` | Bulk API version |
 | `DATABASE_URL` | — | Postgres DSN |
-| `SYNC_OBJECTS` | — | Objects and schedules, e.g. `Account:*/15 * * * *,Contact:0 * * * *` |
-| `MAX_CONCURRENT_JOBS` | `4` | Cap on concurrent Bulk API jobs |
-| `API_RATE_LIMIT` | `10` | Request-per-second ceiling |
-| `WORKER_COUNT` | `4` | CSV-parse and upsert workers |
+| `SYNC_OBJECTS` | — | Objects and schedules, e.g. `Account:*/15 * * * *,Contact:0 * * * *` (see below) |
+| `MAX_CONCURRENT_JOBS` | `4` | Cap on concurrent Bulk API jobs; at least 1 |
+| `API_RATE_LIMIT` | `10` | Request-per-second ceiling; at least 1 |
+| `WORKER_COUNT` | `4` | CSV-parse and upsert workers; at least 1 |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
+
+Each `SYNC_OBJECTS` entry is `Object:cron`:
+
+- `Object` is a Salesforce API name — a letter followed by letters, digits, or
+  underscores, such as `Account`, `Invoice__c`, or `ns__Order__c`. Names must be
+  unique, ignoring case.
+- `cron` is a standard five-field expression (minute, hour, day of month, month,
+  day of week); descriptors such as `@hourly` are also accepted.
 
 ---
 

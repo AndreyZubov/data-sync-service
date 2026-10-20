@@ -2,6 +2,7 @@ package config
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,6 +48,39 @@ func TestParseSyncObjects(t *testing.T) {
 			in:      "Account:",
 			wantErr: true,
 		},
+		{
+			name: "custom and namespaced objects",
+			in:   "Invoice__c:0 * * * *,ns__Order__c:30 2 * * *",
+			want: []ObjectSchedule{
+				{Name: "Invoice__c", Cron: "0 * * * *"},
+				{Name: "ns__Order__c", Cron: "30 2 * * *"},
+			},
+		},
+		{
+			name:    "object name with SOQL metacharacters",
+			in:      "Account WHERE Id != null:0 * * * *",
+			wantErr: true,
+		},
+		{
+			name:    "object name starting with a digit",
+			in:      "1Account:0 * * * *",
+			wantErr: true,
+		},
+		{
+			name:    "duplicate object ignoring case",
+			in:      "Account:0 * * * *,account:*/5 * * * *",
+			wantErr: true,
+		},
+		{
+			name:    "malformed cron",
+			in:      "Account:every hour",
+			wantErr: true,
+		},
+		{
+			name:    "cron with seconds field",
+			in:      "Account:0 0 * * * *",
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -74,6 +108,7 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	assert.Equal(t, 4, cfg.MaxConcurrentJobs)
 	assert.Equal(t, 10, cfg.APIRateLimit)
 	assert.Equal(t, 4, cfg.WorkerCount)
+	assert.Equal(t, 15*time.Second, cfg.ShutdownTimeout)
 	assert.Equal(t, []ObjectSchedule{{Name: "Account", Cron: "*/15 * * * *"}}, cfg.SyncObjects)
 }
 
@@ -112,4 +147,55 @@ func TestLoadRejectsMalformedIntegers(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, cfg)
 	assert.Contains(t, err.Error(), "parse env")
+}
+
+func TestLoadRejectsInvalidValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+		wantMsg string
+	}{
+		{name: "zero workers", env: map[string]string{"WORKER_COUNT": "0"}, wantMsg: "WORKER_COUNT"},
+		{name: "negative concurrency", env: map[string]string{"MAX_CONCURRENT_JOBS": "-1"}, wantMsg: "MAX_CONCURRENT_JOBS"},
+		{name: "zero rate limit", env: map[string]string{"API_RATE_LIMIT": "0"}, wantMsg: "API_RATE_LIMIT"},
+		{name: "zero shutdown timeout", env: map[string]string{"SHUTDOWN_TIMEOUT": "0s"}, wantMsg: "SHUTDOWN_TIMEOUT"},
+		{name: "plain http login URL", env: map[string]string{"SF_LOGIN_URL": "http://login.salesforce.com"}, wantMsg: "SF_LOGIN_URL"},
+		{name: "unparsable login URL", env: map[string]string{"SF_LOGIN_URL": "https://[::1"}, wantMsg: "SF_LOGIN_URL"},
+		{name: "relative login URL", env: map[string]string{"SF_LOGIN_URL": "login.salesforce.com"}, wantMsg: "SF_LOGIN_URL"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			cfg, err := Load()
+
+			require.Error(t, err)
+			assert.Nil(t, cfg)
+			assert.Contains(t, err.Error(), tt.wantMsg)
+		})
+	}
+}
+
+func TestLoadReportsAllInvalidValuesAtOnce(t *testing.T) {
+	t.Setenv("WORKER_COUNT", "0")
+	t.Setenv("API_RATE_LIMIT", "0")
+
+	_, err := Load()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "WORKER_COUNT")
+	assert.Contains(t, err.Error(), "API_RATE_LIMIT")
+}
+
+func TestObjectNames(t *testing.T) {
+	cfg := Config{SyncObjects: []ObjectSchedule{
+		{Name: "Account", Cron: "0 * * * *"},
+		{Name: "Contact", Cron: "0 * * * *"},
+	}}
+
+	assert.Equal(t, []string{"Account", "Contact"}, cfg.ObjectNames())
+	assert.Empty(t, (&Config{}).ObjectNames())
 }

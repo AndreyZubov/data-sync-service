@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"go.uber.org/zap"
 
 	"github.com/AndreyZubov/data-sync-service/internal/api"
@@ -20,6 +22,15 @@ import (
 
 // version is stamped at build time via -ldflags "-X main.version=...".
 var version = "dev"
+
+// HTTP server timeouts. writeTimeout must outlast api.RequestTimeout, otherwise
+// the connection is closed before a timed-out request receives its 504.
+const (
+	readHeaderTimeout = 10 * time.Second
+	readTimeout       = 30 * time.Second
+	writeTimeout      = api.RequestTimeout + 5*time.Second
+	idleTimeout       = 120 * time.Second
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -47,10 +58,19 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.NewServer(log).Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
+		Handler:           api.NewServer(log, reg, cfg.ObjectNames()).Handler(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
 	}
 
 	// Run the HTTP server and surface its error through a channel.
@@ -70,7 +90,7 @@ func run() error {
 	}
 
 	// Graceful shutdown: stop accepting new requests, let in-flight finish.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return err
