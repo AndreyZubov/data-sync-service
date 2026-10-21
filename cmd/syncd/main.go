@@ -19,6 +19,7 @@ import (
 	"github.com/AndreyZubov/data-sync-service/internal/api"
 	"github.com/AndreyZubov/data-sync-service/internal/config"
 	"github.com/AndreyZubov/data-sync-service/internal/logging"
+	"github.com/AndreyZubov/data-sync-service/internal/salesforce"
 )
 
 // version is stamped at build time via -ldflags "-X main.version=...".
@@ -66,21 +67,46 @@ func run() error {
 		return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
 	}
 
-	return serve(ctx, ln, cfg, log)
+	return serve(ctx, ln, newHandler(cfg, log, salesforce.NewHTTPClient()), cfg.ShutdownTimeout, log)
 }
 
-// serve runs the control API on ln until ctx is cancelled or the server fails.
-// On cancellation it stops accepting connections and lets in-flight requests
-// finish for up to cfg.ShutdownTimeout. serve takes ownership of ln.
-func serve(ctx context.Context, ln net.Listener, cfg *config.Config, log *zap.Logger) error {
+// newHandler wires the service's dependencies into the control API. sfHTTP
+// sends all requests to Salesforce.
+func newHandler(cfg *config.Config, log *zap.Logger, sfHTTP *http.Client) http.Handler {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 
+	tokens := salesforce.NewClientCredentials(salesforce.ClientCredentialsConfig{
+		LoginURL:     cfg.SFLoginURL,
+		ClientID:     cfg.SFClientID,
+		ClientSecret: salesforce.Secret(cfg.SFClientSecret),
+		TokenTTL:     cfg.SFTokenTTL,
+		HTTPClient:   sfHTTP,
+	})
+
+	return api.NewServer(log, reg, api.Options{
+		SyncObjects: cfg.ObjectNames(),
+		ReadinessChecks: []api.ReadinessCheck{{
+			// The token is cached, so a passing probe costs no Salesforce call;
+			// an API request here would spend the org's daily quota on every probe.
+			Name: "salesforce",
+			Check: func(ctx context.Context) error {
+				_, err := tokens.Token(ctx)
+				return err
+			},
+		}},
+	}).Handler()
+}
+
+// serve runs handler on ln until ctx is cancelled or the server fails. On
+// cancellation it stops accepting connections and lets in-flight requests
+// finish for up to shutdownTimeout. serve takes ownership of ln.
+func serve(ctx context.Context, ln net.Listener, handler http.Handler, shutdownTimeout time.Duration, log *zap.Logger) error {
 	srv := &http.Server{
-		Handler:           api.NewServer(log, reg, cfg.ObjectNames()).Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
@@ -105,7 +131,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, log *zap.Lo
 
 	// ctx is already cancelled, so draining needs a context that keeps its
 	// values but drops the cancellation, bounded by its own deadline.
-	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownTimeout)
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("graceful shutdown: %w", err)

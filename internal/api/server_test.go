@@ -22,7 +22,7 @@ var testObjects = []string{"Account", "Contact", "Invoice__c"}
 // metrics registry.
 func newTestServer(t *testing.T) http.Handler {
 	t.Helper()
-	return NewServer(zaptest.NewLogger(t), prometheus.NewRegistry(), testObjects).Handler()
+	return NewServer(zaptest.NewLogger(t), prometheus.NewRegistry(), Options{SyncObjects: testObjects}).Handler()
 }
 
 // do issues a request against the router and returns the recorded response.
@@ -33,7 +33,7 @@ func do(t *testing.T, h http.Handler, method, target string) *httptest.ResponseR
 	return rec
 }
 
-func TestHealthAndReadiness(t *testing.T) {
+func TestLiveness(t *testing.T) {
 	h := newTestServer(t)
 
 	tests := []struct {
@@ -42,7 +42,6 @@ func TestHealthAndReadiness(t *testing.T) {
 		status string
 	}{
 		{name: "healthz", path: "/healthz", status: "ok"},
-		{name: "readyz", path: "/readyz", status: "ready"},
 	}
 
 	for _, tt := range tests {
@@ -63,7 +62,7 @@ func TestMetricsEndpointServesGivenRegistry(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	marker := prometheus.NewCounter(prometheus.CounterOpts{Name: "test_marker_total", Help: "marker"})
 	reg.MustRegister(marker)
-	h := NewServer(zaptest.NewLogger(t), reg, testObjects).Handler()
+	h := NewServer(zaptest.NewLogger(t), reg, Options{SyncObjects: testObjects}).Handler()
 
 	do(t, h, http.MethodGet, "/healthz")
 	rec := do(t, h, http.MethodGet, "/metrics")
@@ -77,7 +76,7 @@ func TestMetricsEndpointServesGivenRegistry(t *testing.T) {
 
 func TestHTTPMetricsUseRoutePatterns(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	s := NewServer(zaptest.NewLogger(t), reg, testObjects)
+	s := NewServer(zaptest.NewLogger(t), reg, Options{SyncObjects: testObjects})
 	h := s.Handler()
 
 	do(t, h, http.MethodGet, "/runs/1")
@@ -149,7 +148,7 @@ func TestSyncRejectsUnconfiguredObjects(t *testing.T) {
 
 func TestRequestLogging(t *testing.T) {
 	core, logs := observer.New(zap.DebugLevel)
-	h := NewServer(zap.New(core), prometheus.NewRegistry(), testObjects).Handler()
+	h := NewServer(zap.New(core), prometheus.NewRegistry(), Options{SyncObjects: testObjects}).Handler()
 
 	do(t, h, http.MethodPost, "/sync/Opportunity/export")
 	do(t, h, http.MethodGet, "/healthz")
@@ -186,7 +185,7 @@ func TestRoutingErrors(t *testing.T) {
 // taking the process down.
 func TestRecovererContainsPanics(t *testing.T) {
 	core, logs := observer.New(zap.InfoLevel)
-	s := NewServer(zap.New(core), prometheus.NewRegistry(), testObjects)
+	s := NewServer(zap.New(core), prometheus.NewRegistry(), Options{SyncObjects: testObjects})
 	s.router.Get("/boom", func(http.ResponseWriter, *http.Request) {
 		panic("boom")
 	})

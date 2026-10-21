@@ -29,22 +29,31 @@ type Server struct {
 	// objects maps lower-cased object names to their configured spelling;
 	// Salesforce API names are case-insensitive.
 	objects map[string]string
+	checks  []ReadinessCheck
+}
+
+// Options configures the control API.
+type Options struct {
+	// SyncObjects lists the Salesforce objects the control API accepts;
+	// requests for any other object are answered with 404 Not Found.
+	SyncObjects []string
+	// ReadinessChecks must all pass for /readyz to report ready.
+	ReadinessChecks []ReadinessCheck
 }
 
 // NewServer builds the router with control, health, and metrics endpoints.
 //
 // HTTP metrics are registered on reg, and /metrics serves everything reg
 // gathers. Registering two servers on the same registry panics.
-// syncObjects lists the Salesforce objects the control API accepts; requests
-// for any other object are answered with 404 Not Found.
-func NewServer(log *zap.Logger, reg *prometheus.Registry, syncObjects []string) *Server {
+func NewServer(log *zap.Logger, reg *prometheus.Registry, opts Options) *Server {
 	s := &Server{
 		log:       log,
 		accessLog: log.WithOptions(zap.AddStacktrace(zapcore.FatalLevel + 1)),
 		metrics:   newHTTPMetrics(reg),
-		objects:   make(map[string]string, len(syncObjects)),
+		objects:   make(map[string]string, len(opts.SyncObjects)),
+		checks:    opts.ReadinessChecks,
 	}
-	for _, name := range syncObjects {
+	for _, name := range opts.SyncObjects {
 		s.objects[strings.ToLower(name)] = name
 	}
 

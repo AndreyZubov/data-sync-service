@@ -71,10 +71,3 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
-
-// handleReadyz reports readiness. It will gate on Salesforce token validity
-// and database connectivity once those dependencies exist (roadmap
-// milestone 6); until then the process is always ready.
-func (s *Server) handleReadyz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
-}
