@@ -10,6 +10,9 @@ DATABASE_URL ?= postgres://sync:sync@localhost:5432/sync?sslmode=disable
 GOLANGCI_VERSION ?= v2.13.2
 GOLANGCI := docker run --rm -v "$(CURDIR)":/app -w /app golangci/golangci-lint:$(GOLANGCI_VERSION) golangci-lint
 
+# Pinned so local runs and CI report the same vulnerability findings.
+GOVULNCHECK_VERSION ?= v1.9.0
+
 # Version stamped into the binary at build time.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
@@ -25,7 +28,7 @@ run: ## Run the service from source
 
 .PHONY: build
 build: ## Build the binary into bin/syncd
-	go build -ldflags="$(LDFLAGS)" -o bin/syncd ./cmd/syncd
+	go build -trimpath -ldflags="$(LDFLAGS)" -o bin/syncd ./cmd/syncd
 
 .PHONY: test
 test: ## Run tests with the race detector
@@ -51,6 +54,10 @@ fmt: ## Apply gofumpt + gci formatting
 config-verify: ## Validate .golangci.yml against the linter's schema
 	$(GOLANGCI) config verify
 
+.PHONY: vuln
+vuln: ## Scan dependencies and the standard library for known vulnerabilities
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+
 .PHONY: tidy
 tidy: ## Tidy go.mod / go.sum
 	go mod tidy
@@ -63,13 +70,17 @@ docker-build: ## Build the container image
 compose-up: ## Start the local Postgres container
 	docker compose up -d
 
+.PHONY: compose-app
+compose-app: ## Build and start the service and Postgres in containers
+	docker compose --profile app up -d --build
+
 .PHONY: compose-down
-compose-down: ## Stop the local Postgres container (keeps the volume)
-	docker compose down
+compose-down: ## Stop all local containers (keeps the volume)
+	docker compose --profile app down
 
 .PHONY: compose-clean
-compose-clean: ## Stop the local Postgres container and delete its volume
-	docker compose down -v
+compose-clean: ## Stop all local containers and delete the Postgres volume
+	docker compose --profile app down -v
 
 .PHONY: install-hooks
 install-hooks: ## Install the repository's git pre-commit hook
@@ -78,4 +89,4 @@ install-hooks: ## Install the repository's git pre-commit hook
 
 .PHONY: clean
 clean: ## Remove build artifacts and coverage output
-	rm -rf bin coverage.out coverage.html
+	rm -rf bin dist coverage.out coverage.html
