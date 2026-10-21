@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -14,17 +16,24 @@ import (
 
 	"github.com/AndreyZubov/data-sync-service/internal/config"
 	"github.com/AndreyZubov/data-sync-service/internal/salesforce/sftest"
+	"github.com/AndreyZubov/data-sync-service/internal/store/storetest"
 )
 
-// testConfig returns a configuration pointing at the fake org.
-func testConfig(org *sftest.Server, secret string) *config.Config {
+// testConfig returns a configuration pointing at the fake org and a fresh
+// database.
+func testConfig(t *testing.T, org *sftest.Server, secret string) *config.Config {
+	t.Helper()
 	return &config.Config{
-		ShutdownTimeout: 5 * time.Second,
-		SFLoginURL:      org.URL(),
-		SFClientID:      sftest.ClientID,
-		SFClientSecret:  secret,
-		SFAPIVersion:    sftest.APIVersion,
-		SFTokenTTL:      time.Hour,
+		ShutdownTimeout:   5 * time.Second,
+		SFLoginURL:        org.URL(),
+		SFClientID:        sftest.ClientID,
+		SFClientSecret:    secret,
+		SFAPIVersion:      sftest.APIVersion,
+		SFTokenTTL:        time.Hour,
+		DatabaseURL:       storetest.New(t).DSN,
+		MaxConcurrentJobs: 2,
+		WorkerCount:       2,
+		SyncObjects:       []config.ObjectSchedule{{Name: "Account", Cron: "0 0 1 1 *"}},
 	}
 }
 
@@ -41,8 +50,20 @@ func startServe(t *testing.T, cfg *config.Config, sfHTTP *http.Client) (string, 
 	t.Cleanup(cancel)
 
 	log := zaptest.NewLogger(t)
+	a, err := newApp(ctx, cfg, log, sfHTTP)
+	require.NoError(t, err)
+	t.Cleanup(a.store.Close)
 	done := make(chan error, 1)
-	go func() { done <- serve(ctx, ln, newHandler(cfg, log, sfHTTP), cfg.ShutdownTimeout, log) }()
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		done <- serve(ctx, ln, a.handler, cfg.ShutdownTimeout, log, a.orch.Shutdown)
+	}()
+	// Wait for serve, so the store is not closed under a running server.
+	t.Cleanup(func() {
+		cancel()
+		<-finished
+	})
 
 	return "http://" + ln.Addr().String(), cancel, done
 }
@@ -72,7 +93,7 @@ func get(t *testing.T, url string) (int, string) {
 
 func TestServeAnswersUntilCancelledThenShutsDownCleanly(t *testing.T) {
 	org := sftest.NewServer(t)
-	baseURL, cancel, done := startServe(t, testConfig(org, sftest.ClientSecret), org.HTTPClient())
+	baseURL, cancel, done := startServe(t, testConfig(t, org, sftest.ClientSecret), org.HTTPClient())
 
 	status, _ := get(t, baseURL+"/healthz")
 	assert.Equal(t, http.StatusOK, status)
@@ -94,14 +115,14 @@ func TestReadinessFollowsSalesforceAuthentication(t *testing.T) {
 		wantStatus int
 		wantCheck  string
 	}{
-		{name: "valid credentials", secret: sftest.ClientSecret, wantStatus: http.StatusOK, wantCheck: `"salesforce":"ok"`},
+		{name: "valid credentials", secret: sftest.ClientSecret, wantStatus: http.StatusOK, wantCheck: `"database":"ok","salesforce":"ok"`},
 		{name: "rejected credentials", secret: "wrong", wantStatus: http.StatusServiceUnavailable, wantCheck: `"salesforce":"fail"`},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			org := sftest.NewServer(t)
-			baseURL, _, _ := startServe(t, testConfig(org, tt.secret), org.HTTPClient())
+			baseURL, _, _ := startServe(t, testConfig(t, org, tt.secret), org.HTTPClient())
 
 			status, body := get(t, baseURL+"/readyz")
 			assert.Equal(t, tt.wantStatus, status)
@@ -119,11 +140,58 @@ func TestServeReportsServerFailure(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	require.NoError(t, ln.Close())
+	stopped := false
+	stop := func(context.Context) error {
+		stopped = true
+		return errors.New("runs still active")
+	}
 
-	err = serve(context.Background(), ln, http.NotFoundHandler(), time.Second, zaptest.NewLogger(t))
+	err = serve(context.Background(), ln, http.NotFoundHandler(), time.Second, zaptest.NewLogger(t), stop)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "http server")
+	assert.Contains(t, err.Error(), "runs still active")
+	assert.True(t, stopped, "background work is stopped after a server failure too")
+}
+
+func TestExportEndToEnd(t *testing.T) {
+	org := sftest.NewServer(t)
+	org.SetDescribe(sftest.Describe{Name: "Account", Queryable: true, Fields: []sftest.DescribeField{
+		{Name: "Id", Type: "id"}, {Name: "Name", Type: "string"}, {Name: "SystemModstamp", Type: "datetime"},
+	}})
+	org.OnQuery(func(string, string) ([][]string, error) {
+		return [][]string{
+			{"Id", "Name", "SystemModstamp"},
+			{"001A", "Acme", "2026-10-01T12:00:00.000Z"},
+			{"001B", "Globex", "2026-10-01T12:05:00.000Z"},
+			{"001C", "Initech", "2026-10-01T12:10:00.000Z"},
+		}, nil
+	})
+	baseURL, _, _ := startServe(t, testConfig(t, org, sftest.ClientSecret), org.HTTPClient())
+
+	resp, err := http.Post(baseURL+"/sync/account/export", "", nil)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	location := resp.Header.Get("Location")
+	require.NotEmpty(t, location)
+
+	var run struct {
+		Status    string `json:"status"`
+		RecordsOK int    `json:"records_ok"`
+		Error     string `json:"error"`
+	}
+	require.Eventually(t, func() bool {
+		status, body := get(t, baseURL+location)
+		require.Equal(t, http.StatusOK, status)
+		require.NoError(t, json.Unmarshal([]byte(body), &run))
+		return run.Status != "queued" && run.Status != "running"
+	}, 30*time.Second, 50*time.Millisecond)
+
+	assert.Equal(t, "succeeded", run.Status, run.Error)
+	assert.Equal(t, 3, run.RecordsOK)
+	_, metrics := get(t, baseURL+"/metrics")
+	assert.Contains(t, metrics, `sync_records_total{direction="export",object="Account"} 3`)
 }
 
 func TestRunFailsFast(t *testing.T) {
@@ -140,6 +208,7 @@ func TestRunFailsFast(t *testing.T) {
 		{name: "missing credentials", env: map[string]string{"SF_CLIENT_SECRET": ""}, wantMsg: "SF_CLIENT_SECRET is required"},
 		{name: "unknown log level", env: map[string]string{"LOG_LEVEL": "chatty"}, wantMsg: "parse log level"},
 		{name: "address in use", env: map[string]string{"HTTP_ADDR": busy.Addr().String()}, wantMsg: "listen on"},
+		{name: "unreachable database", wantMsg: "migrate database"},
 	}
 
 	for _, tt := range tests {
@@ -147,6 +216,8 @@ func TestRunFailsFast(t *testing.T) {
 			t.Setenv("SF_CLIENT_ID", "client-id")
 			t.Setenv("SF_CLIENT_SECRET", "client-secret")
 			t.Setenv("SF_LOGIN_URL", "https://example.my.salesforce.com")
+			t.Setenv("DATABASE_URL", "postgres://nobody@127.0.0.1:1/none?sslmode=disable&connect_timeout=5")
+			t.Setenv("HTTP_ADDR", "127.0.0.1:0")
 			for k, v := range tt.env {
 				t.Setenv(k, v)
 			}

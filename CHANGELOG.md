@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Export pipeline: `POST /sync/{object}/export` runs a Bulk API 2.0 query job over
+  every queryable field of the object and upserts the results into the
+  `sf_records` table as JSONB. Results are streamed page by page and written by a
+  worker pool through `COPY` and `INSERT ... ON CONFLICT`, so memory use stays flat;
+  newer records are never overwritten by older ones.
+- Incremental sync: each successful export advances the object's `SystemModstamp`
+  watermark, and later runs read only records changed since then, with a
+  five-minute overlap. `?full=true` re-reads everything. Deleted records still in
+  the Recycle Bin are exported with `is_deleted = true`.
+- Scheduled exports from the cron expressions in `SYNC_OBJECTS`.
+- Run records: `GET /runs/{id}` reports status, trigger, record count, Bulk API
+  job ID, timestamps, and errors. One export per object runs at a time (`409
+  Conflict` otherwise), and at most `MAX_CONCURRENT_JOBS` run at once.
+- Graceful shutdown cancels active runs and aborts their Salesforce jobs; runs
+  interrupted by a crash are marked failed at startup.
+- PostgreSQL schema migrations, embedded and applied at startup.
+- `/readyz` checks the database as well as Salesforce authentication.
+- `sync_runs_total`, `sync_records_total`, `sync_run_duration_seconds`, and
+  `sync_active_runs` Prometheus metrics.
 - Salesforce OAuth 2.0 client credentials token provider: caches the token,
   refreshes it a minute before expiry, shares one token request among concurrent
   callers, and never prints the token or client secret.
@@ -19,11 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/readyz` reports `503 Service Unavailable` until Salesforce authentication
   succeeds, with per-check results in the body.
 - `SF_TOKEN_TTL` setting for the assumed access-token lifetime.
-- Control API on chi with `/healthz`, `/readyz`, `/metrics`, and stub
-  `/sync/{object}/export`, `/sync/{object}/import`, and `/runs/{id}` routes that
-  answer `501 Not Implemented`.
+- Control API on chi with `/healthz`, `/readyz`, `/metrics`, and a stub
+  `/sync/{object}/import` route that answers `501 Not Implemented`.
 - Environment-based configuration with startup validation: required Salesforce
-  credentials, an `https` My Domain `SF_LOGIN_URL` (`login.salesforce.com` and
+  credentials and database URL, an `https` My Domain `SF_LOGIN_URL` (`login.salesforce.com` and
   `test.salesforce.com` are rejected, as they do not support the client
   credentials flow), an API version of the form `60.0`, positive worker,
   concurrency, and rate-limit values, Salesforce API names, unique objects, and

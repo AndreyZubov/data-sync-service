@@ -79,7 +79,7 @@ func TestDoSendsAuthenticatedRequestToTheDataAPI(t *testing.T) {
 
 func TestDoJSONRoundTrip(t *testing.T) {
 	org := sftest.NewServer(t)
-	org.Handle("POST /jobs/query", func(w http.ResponseWriter, r *http.Request) {
+	org.Handle("POST /jobs/ingest", func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
 		var in map[string]string
 		assert.NoError(t, json.NewDecoder(r.Body).Decode(&in))
@@ -92,7 +92,7 @@ func TestDoJSONRoundTrip(t *testing.T) {
 		ID    string `json:"id"`
 		Query string `json:"query"`
 	}
-	err := c.DoJSON(context.Background(), http.MethodPost, "/jobs/query",
+	err := c.DoJSON(context.Background(), http.MethodPost, "/jobs/ingest",
 		map[string]string{"query": "SELECT Id FROM Account"}, &out)
 
 	require.NoError(t, err)

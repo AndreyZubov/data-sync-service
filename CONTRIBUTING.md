@@ -29,6 +29,10 @@ make lint    # go vet + golangci-lint
 make test    # go test ./... -race
 ```
 
+Tests that need PostgreSQL start a container with testcontainers, so keep Docker
+running, or point `TEST_DATABASE_URL` at a server whose role may create
+databases. Without either, those tests are skipped locally but fail in CI.
+
 CI runs the same checks plus `go mod tidy` verification, `govulncheck`
 (`make vuln` locally), CodeQL, and a Docker image build. The pre-commit hook installed by `make install-hooks` runs
 lint and tests on any commit touching Go code.
