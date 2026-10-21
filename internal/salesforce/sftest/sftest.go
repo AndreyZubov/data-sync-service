@@ -1,6 +1,7 @@
 // Package sftest provides an in-process fake Salesforce org for tests: an
-// OAuth client credentials token endpoint and a data API whose handlers tests
-// register. It serves HTTPS, so production URL validation applies unchanged.
+// OAuth client credentials token endpoint, object describes, Bulk API 2.0
+// query jobs, and any further data API handlers tests register. It serves
+// HTTPS, so production URL validation applies unchanged.
 package sftest
 
 import (
@@ -30,6 +31,13 @@ type Server struct {
 	validTokens   map[string]bool
 	tokenRequests int
 	tokenOverride *tokenOverride
+
+	describes map[string]Describe
+	onQuery   QueryFunc
+	pageSize  int
+	holdJobs  bool
+	jobs      map[string]*queryJob
+	jobOrder  []string
 }
 
 type tokenOverride struct {
@@ -40,8 +48,19 @@ type tokenOverride struct {
 // NewServer starts a fake org that is shut down when the test ends.
 func NewServer(t testing.TB) *Server {
 	t.Helper()
-	s := &Server{mux: http.NewServeMux(), validTokens: make(map[string]bool)}
+	s := &Server{
+		mux:         http.NewServeMux(),
+		validTokens: make(map[string]bool),
+		describes:   make(map[string]Describe),
+		pageSize:    defaultPageSize,
+		jobs:        make(map[string]*queryJob),
+	}
 	s.mux.HandleFunc("POST /services/oauth2/token", s.handleToken)
+	s.Handle("GET /sobjects/{object}/describe", s.handleDescribe)
+	s.Handle("POST /jobs/query", s.handleCreateQueryJob)
+	s.Handle("GET /jobs/query/{id}", s.handleGetQueryJob)
+	s.Handle("PATCH /jobs/query/{id}", s.handleAbortQueryJob)
+	s.Handle("GET /jobs/query/{id}/results", s.handleQueryResults)
 	s.srv = httptest.NewTLSServer(s.mux)
 	t.Cleanup(s.srv.Close)
 	return s

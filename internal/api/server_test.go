@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -13,16 +14,23 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/AndreyZubov/data-sync-service/internal/store"
 )
 
 // testObjects are the sync objects every test server is configured with.
 var testObjects = []string{"Account", "Contact", "Invoice__c"}
 
-// newTestServer builds a Server with a logger bound to the test and a fresh
-// metrics registry.
+// newTestServer builds a Server with a logger bound to the test, a fresh
+// metrics registry, and runs that fail every call.
 func newTestServer(t *testing.T) http.Handler {
 	t.Helper()
-	return NewServer(zaptest.NewLogger(t), prometheus.NewRegistry(), Options{SyncObjects: testObjects}).Handler()
+	return newServerWithRuns(t, &fakeRuns{err: errors.New("unavailable")})
+}
+
+func newServerWithRuns(t *testing.T, runs Runs) http.Handler {
+	t.Helper()
+	return NewServer(zaptest.NewLogger(t), prometheus.NewRegistry(), Options{SyncObjects: testObjects, Runs: runs}).Handler()
 }
 
 // do issues a request against the router and returns the recorded response.
@@ -62,7 +70,7 @@ func TestMetricsEndpointServesGivenRegistry(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	marker := prometheus.NewCounter(prometheus.CounterOpts{Name: "test_marker_total", Help: "marker"})
 	reg.MustRegister(marker)
-	h := NewServer(zaptest.NewLogger(t), reg, Options{SyncObjects: testObjects}).Handler()
+	h := NewServer(zaptest.NewLogger(t), reg, Options{SyncObjects: testObjects, Runs: &fakeRuns{}}).Handler()
 
 	do(t, h, http.MethodGet, "/healthz")
 	rec := do(t, h, http.MethodGet, "/metrics")
@@ -76,7 +84,7 @@ func TestMetricsEndpointServesGivenRegistry(t *testing.T) {
 
 func TestHTTPMetricsUseRoutePatterns(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	s := NewServer(zaptest.NewLogger(t), reg, Options{SyncObjects: testObjects})
+	s := NewServer(zaptest.NewLogger(t), reg, Options{SyncObjects: testObjects, Runs: &fakeRuns{err: store.ErrNotFound}})
 	h := s.Handler()
 
 	do(t, h, http.MethodGet, "/runs/1")
@@ -85,41 +93,19 @@ func TestHTTPMetricsUseRoutePatterns(t *testing.T) {
 	do(t, h, http.MethodGet, "/another/unknown")
 
 	requests := s.metrics.requests
-	assert.InDelta(t, 2, testutil.ToFloat64(requests.WithLabelValues("GET", "/runs/{id}", "501")), 0)
+	assert.InDelta(t, 2, testutil.ToFloat64(requests.WithLabelValues("GET", "/runs/{id}", "404")), 0)
 	assert.InDelta(t, 2, testutil.ToFloat64(requests.WithLabelValues("GET", unmatchedRoute, "404")), 0)
 }
 
-// The sync pipelines are not implemented yet: the routes must exist and answer
-// 501 rather than 404, and must echo back the path parameter they received.
-func TestSyncStubsReportNotImplemented(t *testing.T) {
-	h := newTestServer(t)
+// The import pipeline is not implemented yet: the route must exist and answer
+// 501 rather than 404.
+func TestImportReportsNotImplemented(t *testing.T) {
+	rec := do(t, newTestServer(t), http.MethodPost, "/sync/contact/import")
 
-	tests := []struct {
-		name    string
-		method  string
-		target  string
-		key     string
-		wantVal string
-	}{
-		{name: "export", method: http.MethodPost, target: "/sync/Account/export", key: "object", wantVal: "Account"},
-		{name: "import", method: http.MethodPost, target: "/sync/Contact/import", key: "object", wantVal: "Contact"},
-		{name: "custom object", method: http.MethodPost, target: "/sync/Invoice__c/export", key: "object", wantVal: "Invoice__c"},
-		{name: "case-insensitive name", method: http.MethodPost, target: "/sync/account/export", key: "object", wantVal: "Account"},
-		{name: "run lookup", method: http.MethodGet, target: "/runs/abc-123", key: "id", wantVal: "abc-123"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			rec := do(t, h, tt.method, tt.target)
-
-			require.Equal(t, http.StatusNotImplemented, rec.Code)
-
-			var body map[string]string
-			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
-			assert.Equal(t, tt.wantVal, body[tt.key])
-			assert.NotEmpty(t, body["status"])
-		})
-	}
+	require.Equal(t, http.StatusNotImplemented, rec.Code)
+	var body map[string]string
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	assert.Equal(t, "Contact", body["object"], "the configured spelling is used")
 }
 
 func TestSyncRejectsUnconfiguredObjects(t *testing.T) {
@@ -148,7 +134,10 @@ func TestSyncRejectsUnconfiguredObjects(t *testing.T) {
 
 func TestRequestLogging(t *testing.T) {
 	core, logs := observer.New(zap.DebugLevel)
-	h := NewServer(zap.New(core), prometheus.NewRegistry(), Options{SyncObjects: testObjects}).Handler()
+	h := NewServer(zap.New(core), prometheus.NewRegistry(), Options{
+		SyncObjects: testObjects,
+		Runs:        &fakeRuns{err: errors.New("database down")},
+	}).Handler()
 
 	do(t, h, http.MethodPost, "/sync/Opportunity/export")
 	do(t, h, http.MethodGet, "/healthz")
@@ -185,7 +174,7 @@ func TestRoutingErrors(t *testing.T) {
 // taking the process down.
 func TestRecovererContainsPanics(t *testing.T) {
 	core, logs := observer.New(zap.InfoLevel)
-	s := NewServer(zap.New(core), prometheus.NewRegistry(), Options{SyncObjects: testObjects})
+	s := NewServer(zap.New(core), prometheus.NewRegistry(), Options{SyncObjects: testObjects, Runs: &fakeRuns{}})
 	s.router.Get("/boom", func(http.ResponseWriter, *http.Request) {
 		panic("boom")
 	})

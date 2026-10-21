@@ -2,6 +2,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -12,6 +13,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+
+	"github.com/AndreyZubov/data-sync-service/internal/store"
 )
 
 // RequestTimeout bounds how long a single control API request may run before
@@ -30,6 +33,16 @@ type Server struct {
 	// Salesforce API names are case-insensitive.
 	objects map[string]string
 	checks  []ReadinessCheck
+	runs    Runs
+}
+
+// Runs starts and looks up sync runs; *syncer.Orchestrator implements it.
+type Runs interface {
+	// StartExport queues an export run of object; see
+	// syncer.Orchestrator.StartExport for the errors it returns.
+	StartExport(ctx context.Context, object string, trigger store.Trigger, full bool) (store.Run, error)
+	// GetRun returns a run, or store.ErrNotFound.
+	GetRun(ctx context.Context, id int64) (store.Run, error)
 }
 
 // Options configures the control API.
@@ -39,6 +52,8 @@ type Options struct {
 	SyncObjects []string
 	// ReadinessChecks must all pass for /readyz to report ready.
 	ReadinessChecks []ReadinessCheck
+	// Runs serves the export and run endpoints.
+	Runs Runs
 }
 
 // NewServer builds the router with control, health, and metrics endpoints.
@@ -52,6 +67,7 @@ func NewServer(log *zap.Logger, reg *prometheus.Registry, opts Options) *Server 
 		metrics:   newHTTPMetrics(reg),
 		objects:   make(map[string]string, len(opts.SyncObjects)),
 		checks:    opts.ReadinessChecks,
+		runs:      opts.Runs,
 	}
 	for _, name := range opts.SyncObjects {
 		s.objects[strings.ToLower(name)] = name
@@ -68,7 +84,7 @@ func NewServer(log *zap.Logger, reg *prometheus.Registry, opts Options) *Server 
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(RequestTimeout))
 
-	// Sync control — stubs until the pipelines land.
+	// Sync control.
 	r.Post("/sync/{object}/export", s.handleExport)
 	r.Post("/sync/{object}/import", s.handleImport)
 	r.Get("/runs/{id}", s.handleRun)
