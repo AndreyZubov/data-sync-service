@@ -1,0 +1,49 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  # Weekly run picks up newly published queries even when the code is unchanged.
+  schedule:
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  # The newest 1.26.x patch, not the minimum in go.mod: binaries and scans
+  # must use a standard library with all security fixes.
+  GO_VERSION: "1.26"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze Go
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          languages: go
+          build-mode: autobuild
+          queries: security-and-quality
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          category: /language:go

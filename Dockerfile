@@ -11,7 +11,9 @@ RUN go mod download
 COPY . .
 
 ARG VERSION=dev
-RUN CGO_ENABLED=0 GOOS=linux go build \
+ARG TARGETOS=linux
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
         -ldflags="-s -w -X main.version=${VERSION}" \
         -o /out/syncd ./cmd/syncd
 

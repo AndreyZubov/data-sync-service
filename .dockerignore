@@ -24,8 +24,11 @@ coverage.html
 # Docs and compose (not needed in the image build context)
 docs/
 README.md
+CHANGELOG.md
 CONTRIBUTING.md
 SECURITY.md
 CODE_OF_CONDUCT.md
 LICENSE
 docker-compose.yml
+.goreleaser.yaml
+.editorconfig
