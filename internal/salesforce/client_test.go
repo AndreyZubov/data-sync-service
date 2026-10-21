@@ -79,7 +79,7 @@ func TestDoSendsAuthenticatedRequestToTheDataAPI(t *testing.T) {
 
 func TestDoJSONRoundTrip(t *testing.T) {
 	org := sftest.NewServer(t)
-	org.Handle("POST /jobs/ingest", func(w http.ResponseWriter, r *http.Request) {
+	org.Handle("POST /sobjects/Account", func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
 		var in map[string]string
 		assert.NoError(t, json.NewDecoder(r.Body).Decode(&in))
@@ -92,7 +92,7 @@ func TestDoJSONRoundTrip(t *testing.T) {
 		ID    string `json:"id"`
 		Query string `json:"query"`
 	}
-	err := c.DoJSON(context.Background(), http.MethodPost, "/jobs/ingest",
+	err := c.DoJSON(context.Background(), http.MethodPost, "/sobjects/Account",
 		map[string]string{"query": "SELECT Id FROM Account"}, &out)
 
 	require.NoError(t, err)
@@ -175,10 +175,10 @@ func TestDoRetryPolicy(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			org := sftest.NewServer(t)
 			handler, calls := sequence(tt.statuses...)
-			org.Handle(tt.method+" /jobs/ingest", handler)
+			org.Handle(tt.method+" /sobjects/Account", handler)
 			c := newTestClient(t, org)
 
-			err := c.DoJSON(context.Background(), tt.method, "/jobs/ingest", nil, nil)
+			err := c.DoJSON(context.Background(), tt.method, "/sobjects/Account", nil, nil)
 
 			assert.Equal(t, tt.wantCalls, calls.Load())
 			if !tt.wantErr {

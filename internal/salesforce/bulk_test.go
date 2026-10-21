@@ -146,7 +146,7 @@ func TestWaitForFailedQueryJob(t *testing.T) {
 
 func TestAbortQueryJob(t *testing.T) {
 	org := sftest.NewServer(t)
-	org.HoldQueryJobs(true)
+	org.HoldJobs(true)
 	c := newBulkClient(t, org)
 	ctx := context.Background()
 	job, err := c.CreateQueryJob(ctx, Query, "SELECT Id FROM Account")
@@ -163,7 +163,7 @@ func TestAbortQueryJob(t *testing.T) {
 
 func TestWaitForQueryJobRespectsTheContext(t *testing.T) {
 	org := sftest.NewServer(t)
-	org.HoldQueryJobs(true)
+	org.HoldJobs(true)
 	c := newBulkClient(t, org)
 	job, err := c.CreateQueryJob(context.Background(), Query, "SELECT Id FROM Account")
 	require.NoError(t, err)

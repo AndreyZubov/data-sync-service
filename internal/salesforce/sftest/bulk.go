@@ -24,6 +24,8 @@ type DescribeField struct {
 	Name                string `json:"name"`
 	Type                string `json:"type"`
 	DeprecatedAndHidden bool   `json:"deprecatedAndHidden,omitempty"`
+	Createable          bool   `json:"createable,omitempty"`
+	Updateable          bool   `json:"updateable,omitempty"`
 }
 
 // QueryFunc produces the result of a query job: a header row of field names
@@ -66,9 +68,9 @@ func (s *Server) SetResultPageSize(n int) {
 	s.pageSize = n
 }
 
-// HoldQueryJobs keeps query jobs in progress while hold is true, for tests of
-// runs that must not finish yet.
-func (s *Server) HoldQueryJobs(hold bool) {
+// HoldJobs keeps query and ingest jobs in progress while hold is true, for
+// tests of runs that must not finish yet.
+func (s *Server) HoldJobs(hold bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.holdJobs = hold

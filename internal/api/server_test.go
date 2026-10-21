@@ -30,7 +30,14 @@ func newTestServer(t *testing.T) http.Handler {
 
 func newServerWithRuns(t *testing.T, runs Runs) http.Handler {
 	t.Helper()
-	return NewServer(zaptest.NewLogger(t), prometheus.NewRegistry(), Options{SyncObjects: testObjects, Runs: runs}).Handler()
+	return newServerWith(t, runs, &fakeOutbox{err: errors.New("unavailable")})
+}
+
+func newServerWith(t *testing.T, runs Runs, outbox Outbox) http.Handler {
+	t.Helper()
+	return NewServer(zaptest.NewLogger(t), prometheus.NewRegistry(), Options{
+		SyncObjects: testObjects, Runs: runs, Outbox: outbox,
+	}).Handler()
 }
 
 // do issues a request against the router and returns the recorded response.
@@ -97,17 +104,6 @@ func TestHTTPMetricsUseRoutePatterns(t *testing.T) {
 	assert.InDelta(t, 2, testutil.ToFloat64(requests.WithLabelValues("GET", unmatchedRoute, "404")), 0)
 }
 
-// The import pipeline is not implemented yet: the route must exist and answer
-// 501 rather than 404.
-func TestImportReportsNotImplemented(t *testing.T) {
-	rec := do(t, newTestServer(t), http.MethodPost, "/sync/contact/import")
-
-	require.Equal(t, http.StatusNotImplemented, rec.Code)
-	var body map[string]string
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
-	assert.Equal(t, "Contact", body["object"], "the configured spelling is used")
-}
-
 func TestSyncRejectsUnconfiguredObjects(t *testing.T) {
 	h := newTestServer(t)
 
@@ -117,6 +113,7 @@ func TestSyncRejectsUnconfiguredObjects(t *testing.T) {
 	}{
 		{name: "unknown object", target: "/sync/Opportunity/export"},
 		{name: "unknown object on import", target: "/sync/Lead/import"},
+		{name: "unknown object on dead-letter retry", target: "/sync/Lead/dead-letters/retry"},
 		{name: "SOQL injection attempt", target: "/sync/Account%20WHERE%20Id%20!=%20null/export"},
 	}
 

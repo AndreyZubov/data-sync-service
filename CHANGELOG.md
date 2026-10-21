@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Import pipeline: changes that other systems insert into the `sf_outbox` table
+  (`insert`, `update`, `upsert` by external ID, or `delete`) are sent to Salesforce
+  through Bulk API 2.0 ingest jobs by `POST /sync/{object}/import` and on every
+  scheduled tick that finds due entries. Entries are validated against the
+  object's describe result before upload, changes to one record are sent one at a
+  time and in order, and per-record results are matched back to their entries.
+- Retries and dead letters: rejected records are retried with exponential backoff
+  up to `IMPORT_MAX_ATTEMPTS` runs, then dead-lettered. `GET
+  /sync/{object}/dead-letters` lists them and `POST
+  /sync/{object}/dead-letters/retry` requeues them.
+- `IMPORT_MAX_RECORDS` and `IMPORT_MAX_ATTEMPTS` settings, `records_failed` in run
+  responses, and the `sync_records_failed_total` and `sync_dead_letters_total`
+  metrics.
 - Export pipeline: `POST /sync/{object}/export` runs a Bulk API 2.0 query job over
   every queryable field of the object and upserts the results into the
   `sf_records` table as JSONB. Results are streamed page by page and written by a
@@ -38,8 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/readyz` reports `503 Service Unavailable` until Salesforce authentication
   succeeds, with per-check results in the body.
 - `SF_TOKEN_TTL` setting for the assumed access-token lifetime.
-- Control API on chi with `/healthz`, `/readyz`, `/metrics`, and a stub
-  `/sync/{object}/import` route that answers `501 Not Implemented`.
+- Control API on chi with `/healthz`, `/readyz`, and `/metrics`.
 - Environment-based configuration with startup validation: required Salesforce
   credentials and database URL, an `https` My Domain `SF_LOGIN_URL` (`login.salesforce.com` and
   `test.salesforce.com` are rejected, as they do not support the client

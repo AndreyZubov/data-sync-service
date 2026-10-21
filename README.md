@@ -9,13 +9,14 @@
 > jobs, manages async job lifecycles, respects org API limits, and recovers cleanly
 > from failures.
 
-**Status:** active development. The export direction works end to end: the service
-authenticates with OAuth client credentials, exports configured objects through
-Bulk API 2.0 query jobs into PostgreSQL, streams results with flat memory use, and
-syncs incrementally from `SystemModstamp` watermarks, on a cron schedule or on
-demand, with every run recorded and inspectable. Import (Postgres → Salesforce) and
-org API-limit awareness are next on the [roadmap](#roadmap); until import lands,
-`/sync/{object}/import` answers `501 Not Implemented`.
+**Status:** active development. Both directions work end to end. The service
+authenticates with OAuth client credentials. It exports configured objects into
+PostgreSQL through Bulk API 2.0 query jobs, streaming results with flat memory use
+and syncing incrementally from `SystemModstamp` watermarks. It imports changes that
+other systems write to an outbox table through Bulk API 2.0 ingest jobs, retrying
+failed records and dead-lettering those that keep failing. Runs start on a cron
+schedule or on demand, and every run is recorded and inspectable. Org API-limit
+awareness and resumable runs are next on the [roadmap](#roadmap).
 
 ---
 
@@ -45,15 +46,15 @@ on-demand                                          cron tick
         +-----------------+-----------------+
         v                                   v
    [ Export ]                          [ Import ]
-   Bulk API query job                  Bulk API ingest job
-   create -> poll -> fetch             stage -> upload -> poll
+   Bulk API query job                  claim due sf_outbox entries
+   create -> poll -> fetch             validate -> upload ingest job -> poll
         |                                   |
         v                                   v
    [ CSV parser ]                      [ Result collector ]
-   worker pool                         failed-record handling
+   worker pool                         match results to entries
         |                                   |
         v                                   v
-   [ Postgres upsert ]                 [ Dead letter ]
+   [ Postgres upsert ]                 [ Retry with backoff / dead letter ]
         |
         v
    [ Watermark store ]  <- SystemModstamp per object, for incremental runs
@@ -101,6 +102,15 @@ curl -X POST localhost:8080/sync/Account/export   # 202 Accepted, Location: /run
 curl localhost:8080/runs/1                        # status and record count
 ```
 
+To write to Salesforce, insert a change into the outbox and start an import (the
+schedule also starts one whenever changes are due):
+
+```bash
+psql "$DATABASE_URL" -c "INSERT INTO sf_outbox (object_name, operation, payload)
+                         VALUES ('Account', 'insert', '{\"Name\": \"Acme\"}')"
+curl -X POST localhost:8080/sync/Account/import   # 202 Accepted, Location: /runs/2
+```
+
 To run the service in a container next to Postgres instead, use
 `make compose-app`; it reads the same `.env`. `make compose-down` stops everything.
 
@@ -135,14 +145,16 @@ docker run --rm -p 8080:8080 --env-file .env ghcr.io/andreyzubov/data-sync-servi
 
 ## HTTP control API
 
-| Method | Path                    | Purpose                              |
-|--------|-------------------------|--------------------------------------|
-| `POST` | `/sync/{object}/export` | Start an export run (see below)      |
-| `POST` | `/sync/{object}/import` | Start an import run *(not yet: 501)* |
-| `GET`  | `/runs/{id}`            | Inspect a run                        |
-| `GET`  | `/healthz`              | Liveness                             |
-| `GET`  | `/readyz`               | Readiness (see below)                |
-| `GET`  | `/metrics`              | Prometheus metrics                   |
+| Method | Path                                | Purpose                                  |
+|--------|-------------------------------------|------------------------------------------|
+| `POST` | `/sync/{object}/export`             | Start an export run (see below)          |
+| `POST` | `/sync/{object}/import`             | Start an import run of the outbox        |
+| `GET`  | `/sync/{object}/dead-letters`       | List dead-lettered outbox entries        |
+| `POST` | `/sync/{object}/dead-letters/retry` | Requeue every dead-lettered entry        |
+| `GET`  | `/runs/{id}`                        | Inspect a run                            |
+| `GET`  | `/healthz`                          | Liveness                                 |
+| `GET`  | `/readyz`                           | Readiness (see below)                    |
+| `GET`  | `/metrics`                          | Prometheus metrics                       |
 
 `{object}` must be one of the objects listed in `SYNC_OBJECTS`; it is matched
 case-insensitively, as Salesforce API names are. Any other value is answered with
@@ -153,11 +165,19 @@ handler timeout, after which the client receives `504 Gateway Timeout`.
 and a `Location: /runs/{id}` header; the export itself runs in the background.
 Add `?full=true` to ignore the watermark and re-read every record. If the object
 is already being exported, the answer is `409 Conflict` with the active `run_id`.
+`POST /sync/{object}/import` behaves the same way for imports, without `full`.
 
-`GET /runs/{id}` returns the run's `status` (`queued`, `running`, `succeeded`,
-`failed`, or `cancelled`), `trigger` (`manual` or `schedule`), `records_ok`, the
-Salesforce `bulk_job_id`, timestamps, and for unsuccessful runs an `error`.
-`records_ok` grows while the run is in progress.
+`GET /runs/{id}` returns the run's `direction`, `status` (`queued`, `running`,
+`succeeded`, `failed`, or `cancelled`), `trigger` (`manual` or `schedule`),
+`records_ok` and `records_failed`, the Salesforce `bulk_job_id` (for an import, its
+latest ingest job), timestamps, and for unsuccessful runs an `error`. The counts
+grow while the run is in progress.
+
+`GET /sync/{object}/dead-letters` lists the object's dead-lettered entries, oldest
+first, with their payload, attempts, and `last_error`; `?limit=` takes 1 to 1,000
+and defaults to 100. After fixing the cause, `POST /sync/{object}/dead-letters/retry`
+returns them all to pending with a fresh set of attempts and answers with the
+number `requeued`.
 
 `/readyz` answers `200` when every dependency check passes and `503` otherwise,
 with a per-check `ok` or `fail` in the body. The checks are Salesforce
@@ -176,7 +196,9 @@ successful health and metrics probes at `debug`, everything else at `info`.
 | `http_requests_total` | `method`, `route`, `status` | Control API requests |
 | `http_request_duration_seconds` | `method`, `route` | Control API request latency |
 | `sync_runs_total` | `object`, `direction`, `status` | Finished sync runs |
-| `sync_records_total` | `object`, `direction` | Records written to Postgres |
+| `sync_records_total` | `object`, `direction` | Records written: exported to Postgres or imported into Salesforce |
+| `sync_records_failed_total` | `object`, `direction` | Records an import could not write |
+| `sync_dead_letters_total` | `object` | Outbox entries dead-lettered |
 | `sync_run_duration_seconds` | `object`, `direction` | Run duration, excluding time queued |
 | `sync_active_runs` | — | Runs currently executing |
 
@@ -233,6 +255,7 @@ Migrations are embedded in the binary and applied at startup.
 | `sf_records` | One row per exported record: `object_name`, `id`, `system_modstamp`, `is_deleted`, `synced_at`, and `data`, a JSONB object keyed by field API name |
 | `sync_runs` | Every run with its status, trigger, Bulk API job ID, counts, error, and timestamps |
 | `sync_state` | The watermark of each object and the run that set it |
+| `sf_outbox` | Changes waiting to be imported into Salesforce, with their delivery status; see [How imports work](#how-imports-work) |
 
 A generic JSONB table means new objects and fields need no schema change. In
 `data`, empty values are `null`, checkboxes are booleans, numeric fields are JSON
@@ -244,6 +267,59 @@ SELECT id, data->>'Name' AS name, (data->>'AnnualRevenue')::numeric AS revenue
 FROM sf_records
 WHERE object_name = 'Account' AND NOT is_deleted;
 ```
+
+---
+
+## How imports work
+
+Other systems request changes by inserting rows into `sf_outbox`, in their own
+transaction if they like, so a change is recorded exactly when their data is. The
+service only reads the columns below and sets the delivery columns.
+
+| Column | Meaning |
+|--------|---------|
+| `object_name` | The Salesforce object, e.g. `Account`; it must be listed in `SYNC_OBJECTS` to be imported |
+| `operation` | `insert`, `update`, `upsert`, or `delete` |
+| `external_id_field` | For `upsert` only: the external ID field to match on |
+| `payload` | A JSON object of field values keyed by API name. `update` and `delete` need `Id`, `upsert` needs the external ID field. `null` or `""` clears a field; an absent field is left unchanged |
+
+```sql
+INSERT INTO sf_outbox (object_name, operation, external_id_field, payload)
+VALUES ('Contact', 'upsert', 'Ext_Id__c', '{"Ext_Id__c": "C-42", "LastName": "Doe", "Email": null}');
+```
+
+An import run then:
+
+1. **Claims** up to `IMPORT_MAX_RECORDS` due entries of the object, oldest first,
+   and marks them `processing`. Only the oldest unsent change of each record is
+   eligible: changes to one record reach Salesforce one at a time and in order, as
+   a Bulk API job processes its rows in no particular order. Records are told apart
+   by `Id` or by the upsert key; inserts are independent.
+2. **Validates** each entry against the object's describe result: every field must
+   exist, be writable by the operation, and hold a JSON scalar. An entry that can
+   never succeed is dead-lettered at once, rather than failing the whole job it
+   would share with valid entries.
+3. **Uploads** one ingest job per operation (and upsert key), split further if an
+   upload would exceed Salesforce's 100 MB limit, and polls it to completion.
+4. **Collects** the per-record results. Salesforce returns them in no particular
+   order and without a caller-supplied tag, but echoes every uploaded column, so
+   each result is matched to the entry with the same values. Each job's outcomes
+   are stored as soon as it finishes.
+
+Accepted entries become `sent`, with the record's `salesforce_id`. Rejected ones,
+for example by a validation rule or a record lock, return to `pending` with the
+error in `last_error` and are retried after one minute, doubling up to an hour,
+until `IMPORT_MAX_ATTEMPTS` runs have tried them; then they become `dead`. A job
+that fails as a whole retries its entries the same way and fails the run. An entry
+Salesforce reports no result for is dead-lettered rather than retried, because it
+may have been applied, and sending an insert twice would duplicate the record.
+
+When a run is cancelled, its ingest job is aborted, the outcomes of records already
+processed are stored, and the remaining entries return to `pending` without using
+an attempt; entries of runs interrupted by a crash are returned at the next
+startup. Updates, upserts, and deletes are safe to repeat; an insert caught by such
+an interruption after Salesforce applied it can be sent twice. Where that matters,
+use `upsert` on an external ID.
 
 ---
 
@@ -267,6 +343,8 @@ value at once.
 | `MAX_CONCURRENT_JOBS` | `4` | Runs executing at once; further runs wait queued. At least 1 |
 | `API_RATE_LIMIT` | `10` | Request-per-second ceiling; at least 1. Not enforced yet (milestone 6) |
 | `WORKER_COUNT` | `4` | Upsert workers per run; at least 1 |
+| `IMPORT_MAX_RECORDS` | `10000` | Outbox entries one import run sends at most; at least 1 |
+| `IMPORT_MAX_ATTEMPTS` | `5` | Import runs that may try an outbox entry before it is dead-lettered; at least 1 |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
 
 Each `SYNC_OBJECTS` entry is `Object:cron`:
@@ -278,6 +356,9 @@ Each `SYNC_OBJECTS` entry is `Object:cron`:
   day of week); descriptors such as `@hourly` are also accepted. Schedules use the
   server's local time zone, which is UTC in the container image.
 
+Every tick starts an export of the object and, when the object has due outbox
+entries, an import.
+
 ---
 
 ## Roadmap
@@ -288,7 +369,7 @@ Each `SYNC_OBJECTS` entry is `Object:cron`:
 | 2 — Auth + HTTP client | OAuth client credentials, Salesforce REST client with retries, readiness check | Done |
 | 3 — Export pipeline | Bulk API query jobs, CSV streaming, Postgres upsert, run records | Done |
 | 4 — Incremental sync | `SystemModstamp` watermarks, scheduled runs | Done |
-| 5 — Import + dead letter | Bulk API ingest jobs, failed-record collection | Planned |
+| 5 — Import + dead letter | Outbox-driven Bulk API ingest jobs, retries with backoff, dead letters | Done |
 | 6 — Resilience | Rate limiting, API-limit tracking, resumable runs | Planned |
 | 7 — Tests and polish | Failure-injection tests, metrics dashboard, architecture docs | Planned |
 
@@ -303,11 +384,11 @@ internal/
   config/             environment configuration loader and validation
   logging/            zap logger constructor
   retry/              exponential backoff with jitter, Retry-After parsing
-  salesforce/         OAuth token provider, REST client, describe, Bulk API query jobs
+  salesforce/         OAuth token provider, REST client, describe, Bulk API query and ingest jobs
   salesforce/sftest/  in-process fake Salesforce org for tests
-  store/              Postgres access: migrations, runs, watermarks, record upserts
+  store/              Postgres access: migrations, runs, watermarks, record upserts, outbox
   store/storetest/    throwaway migrated databases for tests
-  syncer/             run orchestration, scheduling, and the export pipeline
+  syncer/             run orchestration, scheduling, and the export and import pipelines
 scripts/hooks/        git pre-commit hook
 .github/workflows/    CI, CodeQL, and the tag-triggered release
 .goreleaser.yaml      release binaries and checksums
