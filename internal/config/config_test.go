@@ -14,6 +14,7 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("SF_CLIENT_ID", "client-id")
 	t.Setenv("SF_CLIENT_SECRET", "client-secret")
 	t.Setenv("SF_LOGIN_URL", "https://example.my.salesforce.com")
+	t.Setenv("DATABASE_URL", "postgres://sync:sync@localhost:5432/sync")
 }
 
 func TestParseSyncObjects(t *testing.T) {
@@ -185,6 +186,7 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		{name: "missing client ID", env: map[string]string{"SF_CLIENT_ID": ""}, wantMsg: "SF_CLIENT_ID is required"},
 		{name: "blank client secret", env: map[string]string{"SF_CLIENT_SECRET": "  "}, wantMsg: "SF_CLIENT_SECRET is required"},
 		{name: "missing login URL", env: map[string]string{"SF_LOGIN_URL": ""}, wantMsg: "SF_LOGIN_URL is required"},
+		{name: "missing database URL", env: map[string]string{"DATABASE_URL": ""}, wantMsg: "DATABASE_URL is required"},
 		{name: "API version with v prefix", env: map[string]string{"SF_API_VERSION": "v60.0"}, wantMsg: "SF_API_VERSION"},
 		{name: "API version without minor", env: map[string]string{"SF_API_VERSION": "60"}, wantMsg: "SF_API_VERSION"},
 		{name: "token TTL too short", env: map[string]string{"SF_TOKEN_TTL": "1m"}, wantMsg: "SF_TOKEN_TTL"},

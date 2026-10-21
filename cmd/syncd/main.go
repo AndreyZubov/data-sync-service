@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -20,6 +21,8 @@ import (
 	"github.com/AndreyZubov/data-sync-service/internal/config"
 	"github.com/AndreyZubov/data-sync-service/internal/logging"
 	"github.com/AndreyZubov/data-sync-service/internal/salesforce"
+	"github.com/AndreyZubov/data-sync-service/internal/store"
+	"github.com/AndreyZubov/data-sync-service/internal/syncer"
 )
 
 // version is stamped at build time via -ldflags "-X main.version=...".
@@ -67,12 +70,40 @@ func run() error {
 		return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
 	}
 
-	return serve(ctx, ln, newHandler(cfg, log, salesforce.NewHTTPClient()), cfg.ShutdownTimeout, log)
+	a, err := newApp(ctx, cfg, log, salesforce.NewHTTPClient())
+	if err != nil {
+		_ = ln.Close()
+		return err
+	}
+	defer a.store.Close()
+
+	if err := a.orch.Schedule(cfg.SyncObjects); err != nil {
+		_ = ln.Close()
+		return err
+	}
+	return serve(ctx, ln, a.handler, cfg.ShutdownTimeout, log, a.orch.Shutdown)
 }
 
-// newHandler wires the service's dependencies into the control API. sfHTTP
-// sends all requests to Salesforce.
-func newHandler(cfg *config.Config, log *zap.Logger, sfHTTP *http.Client) http.Handler {
+// app holds the wired service.
+type app struct {
+	handler http.Handler
+	orch    *syncer.Orchestrator
+	store   *store.Store
+}
+
+// newApp migrates the database and wires the service's dependencies. sfHTTP
+// sends all requests to Salesforce. The caller must close the returned store.
+func newApp(ctx context.Context, cfg *config.Config, log *zap.Logger, sfHTTP *http.Client) (*app, error) {
+	if err := store.Migrate(cfg.DatabaseURL); err != nil {
+		return nil, fmt.Errorf("migrate database: %w", err)
+	}
+	// Every worker of every concurrent run may hold a connection, and the
+	// control API and run bookkeeping need a few more.
+	st, err := store.Open(ctx, cfg.DatabaseURL, poolSize(cfg.MaxConcurrentJobs*cfg.WorkerCount+4))
+	if err != nil {
+		return nil, err
+	}
+
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -86,25 +117,60 @@ func newHandler(cfg *config.Config, log *zap.Logger, sfHTTP *http.Client) http.H
 		TokenTTL:     cfg.SFTokenTTL,
 		HTTPClient:   sfHTTP,
 	})
+	sf := salesforce.NewClient(salesforce.ClientConfig{
+		Tokens:     tokens,
+		APIVersion: cfg.SFAPIVersion,
+		HTTPClient: sfHTTP,
+		Logger:     log,
+	})
 
-	return api.NewServer(log, reg, api.Options{
+	orch := syncer.New(syncer.Config{
+		Salesforce:        sf,
+		Store:             st,
+		Workers:           cfg.WorkerCount,
+		MaxConcurrentRuns: cfg.MaxConcurrentJobs,
+		Logger:            log,
+		Registerer:        reg,
+	})
+	if err := orch.RecoverInterruptedRuns(ctx); err != nil {
+		st.Close()
+		return nil, err
+	}
+
+	handler := api.NewServer(log, reg, api.Options{
 		SyncObjects: cfg.ObjectNames(),
-		ReadinessChecks: []api.ReadinessCheck{{
-			// The token is cached, so a passing probe costs no Salesforce call;
-			// an API request here would spend the org's daily quota on every probe.
-			Name: "salesforce",
-			Check: func(ctx context.Context) error {
-				_, err := tokens.Token(ctx)
-				return err
+		Runs:        orch,
+		ReadinessChecks: []api.ReadinessCheck{
+			{
+				// The token is cached, so a passing probe costs no Salesforce call;
+				// an API request here would spend the org's daily quota on every probe.
+				Name: "salesforce",
+				Check: func(ctx context.Context) error {
+					_, err := tokens.Token(ctx)
+					return err
+				},
 			},
-		}},
+			{Name: "database", Check: st.Ping},
+		},
 	}).Handler()
+
+	return &app{handler: handler, orch: orch, store: st}, nil
+}
+
+// poolSize converts a connection count to the pool's type, saturating
+// instead of overflowing.
+func poolSize(n int) int32 {
+	return int32(min(n, math.MaxInt32)) //nolint:gosec // bounded by the min above
 }
 
 // serve runs handler on ln until ctx is cancelled or the server fails. On
-// cancellation it stops accepting connections and lets in-flight requests
-// finish for up to shutdownTimeout. serve takes ownership of ln.
-func serve(ctx context.Context, ln net.Listener, handler http.Handler, shutdownTimeout time.Duration, log *zap.Logger) error {
+// cancellation or failure it stops accepting connections, lets in-flight
+// requests finish, and then calls each of stop in order, all within
+// shutdownTimeout. serve takes ownership of ln.
+func serve(
+	ctx context.Context, ln net.Listener, handler http.Handler, shutdownTimeout time.Duration, log *zap.Logger,
+	stop ...func(context.Context) error,
+) error {
 	srv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
@@ -122,19 +188,30 @@ func serve(ctx context.Context, ln net.Listener, handler http.Handler, shutdownT
 		}
 	}()
 
+	var errs []error
 	select {
 	case err := <-serverErr:
-		return fmt.Errorf("http server: %w", err)
+		errs = append(errs, fmt.Errorf("http server: %w", err))
 	case <-ctx.Done():
 		log.Info("shutdown signal received, draining")
 	}
 
-	// ctx is already cancelled, so draining needs a context that keeps its
-	// values but drops the cancellation, bounded by its own deadline.
+	// ctx may already be cancelled, so draining needs a context that keeps its
+	// values but drops the cancellation, bounded by its own deadline. The stop
+	// functions run even after a server failure, so background work is never
+	// abandoned mid-write.
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("graceful shutdown: %w", err)
+		errs = append(errs, fmt.Errorf("graceful shutdown: %w", err))
+	}
+	for _, fn := range stop {
+		if err := fn(shutdownCtx); err != nil {
+			errs = append(errs, fmt.Errorf("graceful shutdown: %w", err))
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 	log.Info("shutdown complete")
 	return nil

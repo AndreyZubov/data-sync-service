@@ -127,6 +127,7 @@ func (c *Config) validate() error {
 		{"SF_CLIENT_ID", c.SFClientID},
 		{"SF_CLIENT_SECRET", c.SFClientSecret},
 		{"SF_LOGIN_URL", c.SFLoginURL},
+		{"DATABASE_URL", c.DatabaseURL},
 	}
 	for _, r := range required {
 		if strings.TrimSpace(r.value) == "" {

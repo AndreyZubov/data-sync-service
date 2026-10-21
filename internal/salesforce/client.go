@@ -73,6 +73,11 @@ type ClientConfig struct {
 	Retry retry.Policy
 	// Logger records retries; a no-op logger is used when nil.
 	Logger *zap.Logger
+	// JobPollInterval is the first wait between Bulk API job status checks;
+	// it doubles after every check up to JobPollMaxInterval. Zero values
+	// default to one and thirty seconds.
+	JobPollInterval    time.Duration
+	JobPollMaxInterval time.Duration
 }
 
 // Client sends authenticated requests to the Salesforce data API. It is safe
@@ -83,6 +88,9 @@ type Client struct {
 	http       *http.Client
 	retry      retry.Policy
 	log        *zap.Logger
+
+	pollInterval    time.Duration
+	pollMaxInterval time.Duration
 }
 
 // NewClient returns a client for the given configuration.
@@ -93,6 +101,9 @@ func NewClient(cfg ClientConfig) *Client {
 		http:       cfg.HTTPClient,
 		retry:      cfg.Retry,
 		log:        cfg.Logger,
+
+		pollInterval:    cfg.JobPollInterval,
+		pollMaxInterval: cfg.JobPollMaxInterval,
 	}
 	if c.http == nil {
 		c.http = NewHTTPClient()
@@ -102,6 +113,12 @@ func NewClient(cfg ClientConfig) *Client {
 	}
 	if c.log == nil {
 		c.log = zap.NewNop()
+	}
+	if c.pollInterval <= 0 {
+		c.pollInterval = defaultJobPollInterval
+	}
+	if c.pollMaxInterval <= 0 {
+		c.pollMaxInterval = defaultJobPollMaxInterval
 	}
 	return c
 }
