@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -42,8 +43,8 @@ const (
 	Cancelled RunStatus = "cancelled"
 )
 
-// maxErrorLength bounds the stored failure message; Salesforce and Postgres
-// errors are short, but a wrapped chain should not bloat the runs table.
+// maxErrorLength bounds stored failure messages; Salesforce and Postgres
+// errors are short, but a wrapped chain should not bloat the tables.
 const maxErrorLength = 2000
 
 // Run is one sync of one object in one direction.
@@ -138,15 +139,19 @@ func (s *Store) SetBulkJob(ctx context.Context, id int64, jobID string) error {
 func (s *Store) FinishRun(ctx context.Context, id int64, status RunStatus, cause error) error {
 	var msg *string
 	if cause != nil {
-		m := cause.Error()
-		if len(m) > maxErrorLength {
-			m = m[:maxErrorLength]
-		}
+		m := truncateError(cause.Error())
 		msg = &m
 	}
 	return s.execOne(ctx, "finish run", id, `
 		UPDATE sync_runs SET status = $2, error = $3, finished_at = now()
 		WHERE id = $1 AND status IN ('queued', 'running')`, id, status, msg)
+}
+
+// CompleteRun marks a running run succeeded.
+func (s *Store) CompleteRun(ctx context.Context, id int64) error {
+	return s.execOne(ctx, "complete run", id, `
+		UPDATE sync_runs SET status = 'succeeded', finished_at = now()
+		WHERE id = $1 AND status = 'running'`, id)
 }
 
 // CompleteExport marks an export run succeeded and, when watermark is not nil,
@@ -182,17 +187,26 @@ func (s *Store) CompleteExport(ctx context.Context, run Run, watermark *time.Tim
 	})
 }
 
-// FailInterruptedRuns marks every queued or running run as failed. It is meant
-// for startup, when no run can still be in progress, and returns the number of
-// runs it closed. It assumes a single service instance per database.
+// FailInterruptedRuns marks every queued or running run as failed and returns
+// the outbox entries they were sending to pending. It is meant for startup,
+// when no run can still be in progress, and returns the number of runs it
+// closed. It assumes a single service instance per database.
 func (s *Store) FailInterruptedRuns(ctx context.Context) (int64, error) {
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE sync_runs SET status = 'failed', error = 'interrupted by a service restart', finished_at = now()
-		WHERE status IN ('queued', 'running')`)
-	if err != nil {
-		return 0, fmt.Errorf("fail interrupted runs: %w", err)
-	}
-	return tag.RowsAffected(), nil
+	var n int64
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE sync_runs SET status = 'failed', error = 'interrupted by a service restart', finished_at = now()
+			WHERE status IN ('queued', 'running')`)
+		if err != nil {
+			return fmt.Errorf("fail interrupted runs: %w", err)
+		}
+		n = tag.RowsAffected()
+		if _, err := tx.Exec(ctx, releaseOutboxSQL); err != nil {
+			return fmt.Errorf("release outbox entries of interrupted runs: %w", err)
+		}
+		return nil
+	})
+	return n, err
 }
 
 // Watermark returns the object's watermark, or nil if it has none yet.
@@ -206,6 +220,19 @@ func (s *Store) Watermark(ctx context.Context, object string) (*time.Time, error
 		return nil, fmt.Errorf("get watermark of %s: %w", object, err)
 	}
 	return watermark, nil
+}
+
+// truncateError bounds an error message to maxErrorLength bytes without
+// splitting a UTF-8 sequence.
+func truncateError(msg string) string {
+	if len(msg) <= maxErrorLength {
+		return msg
+	}
+	cut := maxErrorLength
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut]
 }
 
 // execOne runs a statement that must change exactly the run with the given ID.

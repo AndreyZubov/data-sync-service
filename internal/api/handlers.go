@@ -60,6 +60,23 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	run, err := s.runs.StartExport(r.Context(), object, store.Manual, full)
+	s.writeStarted(w, object, run, err, store.Export)
+}
+
+// handleImport starts an import run of {object}, which sends its due outbox
+// entries to Salesforce, and answers 202 Accepted with the queued run.
+func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
+	object, ok := s.resolveObject(w, r)
+	if !ok {
+		return
+	}
+	run, err := s.runs.StartImport(r.Context(), object, store.Manual)
+	s.writeStarted(w, object, run, err, store.Import)
+}
+
+// writeStarted answers a request to start a run of object in direction dir,
+// given the result of starting it.
+func (s *Server) writeStarted(w http.ResponseWriter, object string, run store.Run, err error, dir store.Direction) {
 	var inProgress *store.RunInProgressError
 	switch {
 	case err == nil:
@@ -67,28 +84,67 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, newRunResponse(run))
 	case errors.As(err, &inProgress):
 		writeJSON(w, http.StatusConflict, map[string]any{
-			"error":  "an export of this object is already in progress",
+			"error":  "an " + string(dir) + " of this object is already in progress",
 			"run_id": inProgress.RunID,
 		})
 	case errors.Is(err, syncer.ErrShuttingDown):
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 	default:
-		s.log.Error("start export", zap.String("object", object), zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "could not start the export")
+		s.log.Error("start run", zap.String("object", object), zap.String("direction", string(dir)), zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "could not start the "+string(dir))
 	}
 }
 
-// handleImport triggers an import run for {object}. Stub until the import
-// pipeline lands (roadmap milestone 5).
-func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
+// Bounds of the limit parameter of the dead-letter listing.
+const (
+	defaultDeadLetterLimit = 100
+	maxDeadLetterLimit     = 1000
+)
+
+// handleDeadLetters lists {object}'s dead-lettered outbox entries, oldest
+// first. The query parameter limit caps how many are returned.
+func (s *Server) handleDeadLetters(w http.ResponseWriter, r *http.Request) {
 	object, ok := s.resolveObject(w, r)
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusNotImplemented, map[string]string{
-		"object": object,
-		"status": "import not implemented yet",
-	})
+	limit := defaultDeadLetterLimit
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > maxDeadLetterLimit {
+			writeError(w, http.StatusBadRequest, "limit must be an integer from 1 to "+strconv.Itoa(maxDeadLetterLimit))
+			return
+		}
+		limit = n
+	}
+
+	entries, err := s.outbox.DeadLetters(r.Context(), object, limit)
+	if err != nil {
+		s.log.Error("list dead letters", zap.String("object", object), zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "could not list the dead letters")
+		return
+	}
+	out := make([]outboxEntryResponse, len(entries))
+	for i, e := range entries {
+		out[i] = newOutboxEntryResponse(e)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": object, "entries": out})
+}
+
+// handleRetryDeadLetters returns {object}'s dead-lettered entries to pending
+// with a fresh set of attempts; the next import run sends them.
+func (s *Server) handleRetryDeadLetters(w http.ResponseWriter, r *http.Request) {
+	object, ok := s.resolveObject(w, r)
+	if !ok {
+		return
+	}
+	n, err := s.outbox.RetryDeadLetters(r.Context(), object)
+	if err != nil {
+		s.log.Error("retry dead letters", zap.String("object", object), zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "could not requeue the dead letters")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": object, "requeued": n})
 }
 
 // handleRun returns a run's status and record counts.

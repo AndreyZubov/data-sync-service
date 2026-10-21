@@ -34,6 +34,8 @@ type Config struct {
 	MaxConcurrentJobs int    `env:"MAX_CONCURRENT_JOBS" envDefault:"4"`
 	APIRateLimit      int    `env:"API_RATE_LIMIT" envDefault:"10"`
 	WorkerCount       int    `env:"WORKER_COUNT" envDefault:"4"`
+	ImportMaxRecords  int    `env:"IMPORT_MAX_RECORDS" envDefault:"10000"`
+	ImportMaxAttempts int    `env:"IMPORT_MAX_ATTEMPTS" envDefault:"5"`
 
 	// Observability.
 	LogLevel string `env:"LOG_LEVEL" envDefault:"info"`
@@ -109,6 +111,8 @@ func (c *Config) validate() error {
 		{"MAX_CONCURRENT_JOBS", c.MaxConcurrentJobs},
 		{"API_RATE_LIMIT", c.APIRateLimit},
 		{"WORKER_COUNT", c.WorkerCount},
+		{"IMPORT_MAX_RECORDS", c.ImportMaxRecords},
+		{"IMPORT_MAX_ATTEMPTS", c.ImportMaxAttempts},
 	}
 	for _, p := range positive {
 		if p.value < 1 {

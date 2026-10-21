@@ -16,6 +16,10 @@ type Field struct {
 	// DeprecatedAndHidden marks fields Salesforce keeps only for
 	// compatibility; they cannot be queried.
 	DeprecatedAndHidden bool `json:"deprecatedAndHidden"`
+	// Createable and Updateable report whether the integration user may set
+	// the field when creating or updating a record.
+	Createable bool `json:"createable"`
+	Updateable bool `json:"updateable"`
 }
 
 // ObjectDescription is the subset of an object's describe result the service

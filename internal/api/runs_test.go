@@ -16,19 +16,28 @@ import (
 )
 
 // fakeRuns returns run for every call, or err when set, and records the
-// arguments of the last StartExport.
+// arguments of the last run started.
 type fakeRuns struct {
 	run store.Run
 	err error
 
-	object  string
-	trigger store.Trigger
-	full    bool
-	id      int64
+	object    string
+	direction store.Direction
+	trigger   store.Trigger
+	full      bool
+	id        int64
 }
 
 func (f *fakeRuns) StartExport(_ context.Context, object string, trigger store.Trigger, full bool) (store.Run, error) {
-	f.object, f.trigger, f.full = object, trigger, full
+	f.object, f.direction, f.trigger, f.full = object, store.Export, trigger, full
+	if f.err != nil {
+		return store.Run{}, f.err
+	}
+	return f.run, nil
+}
+
+func (f *fakeRuns) StartImport(_ context.Context, object string, trigger store.Trigger) (store.Run, error) {
+	f.object, f.direction, f.trigger = object, store.Import, trigger
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
@@ -180,4 +189,152 @@ func TestGetRunErrors(t *testing.T) {
 			assert.NotContains(t, body["error"], "boom")
 		})
 	}
+}
+
+func TestImportStartsARun(t *testing.T) {
+	run := sampleRun
+	run.Direction = store.Import
+	runs := &fakeRuns{run: run}
+
+	rec := do(t, newServerWithRuns(t, runs), http.MethodPost, "/sync/contact/import")
+
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	assert.Equal(t, "/runs/7", rec.Header().Get("Location"))
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	assert.Equal(t, "import", body["direction"])
+	assert.Equal(t, "Contact", runs.object, "the configured spelling is used")
+	assert.Equal(t, store.Import, runs.direction)
+	assert.Equal(t, store.Manual, runs.trigger)
+}
+
+func TestImportErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "already running",
+			err:        &store.RunInProgressError{RunID: 4},
+			wantStatus: http.StatusConflict,
+			wantBody:   `{"error":"an import of this object is already in progress","run_id":4}`,
+		},
+		{
+			name:       "shutting down",
+			err:        syncer.ErrShuttingDown,
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   `{"error":"service is shutting down"}`,
+		},
+		{
+			name:       "unexpected failure is not exposed",
+			err:        errors.New("connection refused"),
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   `{"error":"could not start the import"}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := do(t, newServerWithRuns(t, &fakeRuns{err: tt.err}), http.MethodPost, "/sync/Account/import")
+
+			assert.Equal(t, tt.wantStatus, rec.Code)
+			assert.JSONEq(t, tt.wantBody, rec.Body.String())
+		})
+	}
+}
+
+// fakeOutbox returns entries and requeued, or err when set, and records the
+// arguments of the last call.
+type fakeOutbox struct {
+	entries  []store.OutboxEntry
+	requeued int64
+	err      error
+
+	object string
+	limit  int
+}
+
+func (f *fakeOutbox) DeadLetters(_ context.Context, object string, limit int) ([]store.OutboxEntry, error) {
+	f.object, f.limit = object, limit
+	return f.entries, f.err
+}
+
+func (f *fakeOutbox) RetryDeadLetters(_ context.Context, object string) (int64, error) {
+	f.object = object
+	return f.requeued, f.err
+}
+
+func TestDeadLetters(t *testing.T) {
+	created := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+	outbox := &fakeOutbox{entries: []store.OutboxEntry{{
+		ID:              12,
+		Object:          "Account",
+		Operation:       store.Upsert,
+		ExternalIDField: "Ext_Id__c",
+		Payload:         json.RawMessage(`{"Ext_Id__c":"A-1","Name":"Acme"}`),
+		Status:          store.Dead,
+		Attempts:        5,
+		LastError:       "REQUIRED_FIELD_MISSING:Required fields are missing: [Industry]:Industry --",
+		CreatedAt:       created,
+		UpdatedAt:       created.Add(time.Hour),
+	}}}
+	h := newServerWith(t, &fakeRuns{}, outbox)
+
+	rec := do(t, h, http.MethodGet, "/sync/account/dead-letters")
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.JSONEq(t, `{"object": "Account", "entries": [{
+		"id": 12, "operation": "upsert", "external_id_field": "Ext_Id__c",
+		"payload": {"Ext_Id__c": "A-1", "Name": "Acme"}, "status": "dead", "attempts": 5,
+		"last_error": "REQUIRED_FIELD_MISSING:Required fields are missing: [Industry]:Industry --",
+		"created_at": "2026-10-21T09:00:00Z", "updated_at": "2026-10-21T10:00:00Z"
+	}]}`, rec.Body.String())
+	assert.Equal(t, "Account", outbox.object)
+	assert.Equal(t, 100, outbox.limit, "default limit")
+
+	rec = do(t, h, http.MethodGet, "/sync/Account/dead-letters?limit=5")
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, 5, outbox.limit)
+
+	outbox.entries = nil
+	rec = do(t, h, http.MethodGet, "/sync/Account/dead-letters")
+	assert.JSONEq(t, `{"object": "Account", "entries": []}`, rec.Body.String())
+}
+
+func TestDeadLettersErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		target     string
+		wantStatus int
+	}{
+		{name: "limit not a number", target: "/sync/Account/dead-letters?limit=all", wantStatus: http.StatusBadRequest},
+		{name: "limit zero", target: "/sync/Account/dead-letters?limit=0", wantStatus: http.StatusBadRequest},
+		{name: "limit too large", target: "/sync/Account/dead-letters?limit=1001", wantStatus: http.StatusBadRequest},
+		{name: "store failure", target: "/sync/Account/dead-letters", wantStatus: http.StatusInternalServerError},
+		{name: "unknown object", target: "/sync/Lead/dead-letters", wantStatus: http.StatusNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := do(t, newServerWith(t, &fakeRuns{}, &fakeOutbox{err: errors.New("boom")}), http.MethodGet, tt.target)
+
+			assert.Equal(t, tt.wantStatus, rec.Code)
+			assert.NotContains(t, rec.Body.String(), "boom")
+		})
+	}
+}
+
+func TestRetryDeadLetters(t *testing.T) {
+	outbox := &fakeOutbox{requeued: 3}
+
+	rec := do(t, newServerWith(t, &fakeRuns{}, outbox), http.MethodPost, "/sync/invoice__c/dead-letters/retry")
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.JSONEq(t, `{"object": "Invoice__c", "requeued": 3}`, rec.Body.String())
+	assert.Equal(t, "Invoice__c", outbox.object)
+
+	rec = do(t, newServerWith(t, &fakeRuns{}, &fakeOutbox{err: errors.New("boom")}),
+		http.MethodPost, "/sync/Account/dead-letters/retry")
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.JSONEq(t, `{"error": "could not requeue the dead letters"}`, rec.Body.String())
 }

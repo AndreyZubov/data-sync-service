@@ -34,6 +34,7 @@ type Server struct {
 	objects map[string]string
 	checks  []ReadinessCheck
 	runs    Runs
+	outbox  Outbox
 }
 
 // Runs starts and looks up sync runs; *syncer.Orchestrator implements it.
@@ -41,8 +42,21 @@ type Runs interface {
 	// StartExport queues an export run of object; see
 	// syncer.Orchestrator.StartExport for the errors it returns.
 	StartExport(ctx context.Context, object string, trigger store.Trigger, full bool) (store.Run, error)
+	// StartImport queues an import run of object; see
+	// syncer.Orchestrator.StartImport for the errors it returns.
+	StartImport(ctx context.Context, object string, trigger store.Trigger) (store.Run, error)
 	// GetRun returns a run, or store.ErrNotFound.
 	GetRun(ctx context.Context, id int64) (store.Run, error)
+}
+
+// Outbox inspects and requeues dead-lettered outbox entries; *store.Store
+// implements it.
+type Outbox interface {
+	// DeadLetters returns up to limit dead-lettered entries of object.
+	DeadLetters(ctx context.Context, object string, limit int) ([]store.OutboxEntry, error)
+	// RetryDeadLetters returns the object's dead-lettered entries to pending
+	// and reports how many there were.
+	RetryDeadLetters(ctx context.Context, object string) (int64, error)
 }
 
 // Options configures the control API.
@@ -52,8 +66,10 @@ type Options struct {
 	SyncObjects []string
 	// ReadinessChecks must all pass for /readyz to report ready.
 	ReadinessChecks []ReadinessCheck
-	// Runs serves the export and run endpoints.
+	// Runs serves the export, import, and run endpoints.
 	Runs Runs
+	// Outbox serves the dead-letter endpoints.
+	Outbox Outbox
 }
 
 // NewServer builds the router with control, health, and metrics endpoints.
@@ -68,6 +84,7 @@ func NewServer(log *zap.Logger, reg *prometheus.Registry, opts Options) *Server 
 		objects:   make(map[string]string, len(opts.SyncObjects)),
 		checks:    opts.ReadinessChecks,
 		runs:      opts.Runs,
+		outbox:    opts.Outbox,
 	}
 	for _, name := range opts.SyncObjects {
 		s.objects[strings.ToLower(name)] = name
@@ -87,6 +104,8 @@ func NewServer(log *zap.Logger, reg *prometheus.Registry, opts Options) *Server 
 	// Sync control.
 	r.Post("/sync/{object}/export", s.handleExport)
 	r.Post("/sync/{object}/import", s.handleImport)
+	r.Get("/sync/{object}/dead-letters", s.handleDeadLetters)
+	r.Post("/sync/{object}/dead-letters/retry", s.handleRetryDeadLetters)
 	r.Get("/runs/{id}", s.handleRun)
 
 	// Health & metrics.
