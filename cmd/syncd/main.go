@@ -129,6 +129,8 @@ func newApp(ctx context.Context, cfg *config.Config, log *zap.Logger, sfHTTP *ht
 		Store:             st,
 		Workers:           cfg.WorkerCount,
 		MaxConcurrentRuns: cfg.MaxConcurrentJobs,
+		ImportMaxRecords:  cfg.ImportMaxRecords,
+		ImportMaxAttempts: cfg.ImportMaxAttempts,
 		Logger:            log,
 		Registerer:        reg,
 	})
@@ -140,6 +142,7 @@ func newApp(ctx context.Context, cfg *config.Config, log *zap.Logger, sfHTTP *ht
 	handler := api.NewServer(log, reg, api.Options{
 		SyncObjects: cfg.ObjectNames(),
 		Runs:        orch,
+		Outbox:      st,
 		ReadinessChecks: []api.ReadinessCheck{
 			{
 				// The token is cached, so a passing probe costs no Salesforce call;

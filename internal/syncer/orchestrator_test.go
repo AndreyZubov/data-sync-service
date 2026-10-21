@@ -268,7 +268,7 @@ func TestExportOfUnknownObject(t *testing.T) {
 
 func TestOneActiveExportPerObject(t *testing.T) {
 	e := newEnv(t, 2)
-	e.org.HoldQueryJobs(true)
+	e.org.HoldJobs(true)
 
 	first, err := e.orch.StartExport(context.Background(), "Account", store.Manual, false)
 	require.NoError(t, err)
@@ -279,14 +279,14 @@ func TestOneActiveExportPerObject(t *testing.T) {
 	require.ErrorAs(t, err, &inProgress)
 	assert.Equal(t, first.ID, inProgress.RunID)
 
-	e.org.HoldQueryJobs(false)
+	e.org.HoldJobs(false)
 	assert.Equal(t, store.Succeeded, e.waitForStatus(t, first.ID, store.Succeeded, store.Failed).Status)
 }
 
 func TestConcurrentRunsAreCapped(t *testing.T) {
 	e := newEnv(t, 1)
 	e.org.SetDescribe(sftest.Describe{Name: "Contact", Queryable: true, Fields: []sftest.DescribeField{{Name: "Id", Type: "id"}}})
-	e.org.HoldQueryJobs(true)
+	e.org.HoldJobs(true)
 
 	account, err := e.orch.StartExport(context.Background(), "Account", store.Manual, false)
 	require.NoError(t, err)
@@ -299,7 +299,7 @@ func TestConcurrentRunsAreCapped(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, store.Queued, got.Status, "waits for the only slot")
 
-	e.org.HoldQueryJobs(false)
+	e.org.HoldJobs(false)
 	assert.Equal(t, store.Succeeded, e.waitForStatus(t, account.ID, store.Succeeded).Status)
 	assert.Equal(t, store.Succeeded, e.waitForStatus(t, contact.ID, store.Succeeded).Status)
 }
@@ -307,7 +307,7 @@ func TestConcurrentRunsAreCapped(t *testing.T) {
 func TestShutdownCancelsActiveRuns(t *testing.T) {
 	e := newEnv(t, 1)
 	e.org.SetDescribe(sftest.Describe{Name: "Contact", Queryable: true, Fields: []sftest.DescribeField{{Name: "Id", Type: "id"}}})
-	e.org.HoldQueryJobs(true)
+	e.org.HoldJobs(true)
 	running, err := e.orch.StartExport(context.Background(), "Account", store.Manual, false)
 	require.NoError(t, err)
 	e.waitForStatus(t, running.ID, store.Running)
@@ -372,14 +372,14 @@ func TestScheduleRejectsInvalidCron(t *testing.T) {
 
 func TestScheduledExportSkipsWhileARunIsActive(t *testing.T) {
 	e := newEnv(t, 1)
-	e.org.HoldQueryJobs(true)
+	e.org.HoldJobs(true)
 	run, err := e.orch.StartExport(context.Background(), "Account", store.Manual, false)
 	require.NoError(t, err)
 
-	e.orch.scheduledExport("Account")
+	e.orch.scheduledSync("Account")
 
 	assert.Equal(t, 1, e.count(t, `SELECT count(*) FROM sync_runs`))
-	e.org.HoldQueryJobs(false)
+	e.org.HoldJobs(false)
 	e.waitForStatus(t, run.ID, store.Succeeded)
 }
 

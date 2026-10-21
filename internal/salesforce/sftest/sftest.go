@@ -1,6 +1,6 @@
 // Package sftest provides an in-process fake Salesforce org for tests: an
 // OAuth client credentials token endpoint, object describes, Bulk API 2.0
-// query jobs, and any further data API handlers tests register. It serves
+// query and ingest jobs, and any further data API handlers tests register. It serves
 // HTTPS, so production URL validation applies unchanged.
 package sftest
 
@@ -38,6 +38,12 @@ type Server struct {
 	holdJobs  bool
 	jobs      map[string]*queryJob
 	jobOrder  []string
+
+	onIngest      IngestFunc
+	ingestFailure string
+	issuedIDs     int
+	ingestJobs    map[string]*ingestJob
+	ingestOrder   []string
 }
 
 type tokenOverride struct {
@@ -54,6 +60,7 @@ func NewServer(t testing.TB) *Server {
 		describes:   make(map[string]Describe),
 		pageSize:    defaultPageSize,
 		jobs:        make(map[string]*queryJob),
+		ingestJobs:  make(map[string]*ingestJob),
 	}
 	s.mux.HandleFunc("POST /services/oauth2/token", s.handleToken)
 	s.Handle("GET /sobjects/{object}/describe", s.handleDescribe)
@@ -61,6 +68,13 @@ func NewServer(t testing.TB) *Server {
 	s.Handle("GET /jobs/query/{id}", s.handleGetQueryJob)
 	s.Handle("PATCH /jobs/query/{id}", s.handleAbortQueryJob)
 	s.Handle("GET /jobs/query/{id}/results", s.handleQueryResults)
+	s.Handle("POST /jobs/ingest", s.handleCreateIngestJob)
+	s.Handle("PUT /jobs/ingest/{id}/batches", s.handleUploadIngestData)
+	s.Handle("PATCH /jobs/ingest/{id}", s.handleSetIngestState)
+	s.Handle("GET /jobs/ingest/{id}", s.handleGetIngestJob)
+	for _, set := range []string{"successfulResults", "failedResults", "unprocessedrecords"} {
+		s.Handle("GET /jobs/ingest/{id}/"+set, s.handleIngestResults(set))
+	}
 	s.srv = httptest.NewTLSServer(s.mux)
 	t.Cleanup(s.srv.Close)
 	return s

@@ -118,6 +118,8 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	assert.Equal(t, 4, cfg.MaxConcurrentJobs)
 	assert.Equal(t, 10, cfg.APIRateLimit)
 	assert.Equal(t, 4, cfg.WorkerCount)
+	assert.Equal(t, 10000, cfg.ImportMaxRecords)
+	assert.Equal(t, 5, cfg.ImportMaxAttempts)
 	assert.Equal(t, 15*time.Second, cfg.ShutdownTimeout)
 	assert.Equal(t, 30*time.Minute, cfg.SFTokenTTL)
 	assert.Equal(t, []ObjectSchedule{{Name: "Account", Cron: "*/15 * * * *"}}, cfg.SyncObjects)
@@ -130,6 +132,8 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	t.Setenv("HTTP_ADDR", ":9090")
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("WORKER_COUNT", "16")
+	t.Setenv("IMPORT_MAX_RECORDS", "500")
+	t.Setenv("IMPORT_MAX_ATTEMPTS", "3")
 	t.Setenv("DATABASE_URL", "postgres://user:pass@db:5432/sync")
 	t.Setenv("SYNC_OBJECTS", "")
 
@@ -139,6 +143,8 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	assert.Equal(t, ":9090", cfg.HTTPAddr)
 	assert.Equal(t, "debug", cfg.LogLevel)
 	assert.Equal(t, 16, cfg.WorkerCount)
+	assert.Equal(t, 500, cfg.ImportMaxRecords)
+	assert.Equal(t, 3, cfg.ImportMaxAttempts)
 	assert.Equal(t, "postgres://user:pass@db:5432/sync", cfg.DatabaseURL)
 	assert.Equal(t, "client-id", cfg.SFClientID)
 	assert.Equal(t, "client-secret", cfg.SFClientSecret)
@@ -176,6 +182,8 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 	}{
 		{name: "zero workers", env: map[string]string{"WORKER_COUNT": "0"}, wantMsg: "WORKER_COUNT"},
 		{name: "negative concurrency", env: map[string]string{"MAX_CONCURRENT_JOBS": "-1"}, wantMsg: "MAX_CONCURRENT_JOBS"},
+		{name: "zero import batch", env: map[string]string{"IMPORT_MAX_RECORDS": "0"}, wantMsg: "IMPORT_MAX_RECORDS"},
+		{name: "zero import attempts", env: map[string]string{"IMPORT_MAX_ATTEMPTS": "0"}, wantMsg: "IMPORT_MAX_ATTEMPTS"},
 		{name: "zero rate limit", env: map[string]string{"API_RATE_LIMIT": "0"}, wantMsg: "API_RATE_LIMIT"},
 		{name: "zero shutdown timeout", env: map[string]string{"SHUTDOWN_TIMEOUT": "0s"}, wantMsg: "SHUTDOWN_TIMEOUT"},
 		{name: "plain http login URL", env: map[string]string{"SF_LOGIN_URL": "http://login.salesforce.com"}, wantMsg: "SF_LOGIN_URL"},

@@ -24,9 +24,12 @@ const (
 // JobState is the state of a Bulk API 2.0 job.
 type JobState string
 
-// Bulk API 2.0 query job states. A query job starts in UploadComplete, moves
-// to InProgress, and ends in JobComplete, Failed, or Aborted.
+// Bulk API 2.0 job states. An ingest job starts Open and moves to
+// UploadComplete once its data is uploaded; a query job starts in
+// UploadComplete. Both then move to InProgress and end in JobComplete,
+// Failed, or Aborted.
 const (
+	JobOpen           JobState = "Open"
 	JobUploadComplete JobState = "UploadComplete"
 	JobInProgress     JobState = "InProgress"
 	JobComplete       JobState = "JobComplete"
@@ -112,23 +115,37 @@ func (c *Client) AbortQueryJob(ctx context.Context, id string) error {
 // WaitForQueryJob polls a query job until it reaches a terminal state. It
 // returns the completed job, or a *JobError if the job failed or was aborted.
 func (c *Client) WaitForQueryJob(ctx context.Context, id string) (QueryJob, error) {
+	var job QueryJob
+	err := c.waitForJob(ctx, "query", id, func(ctx context.Context) (JobState, string, error) {
+		var err error
+		job, err = c.GetQueryJob(ctx, id)
+		return job.State, job.ErrorMessage, err
+	})
+	return job, err
+}
+
+// waitForJob polls a job of the given kind through status until it reaches
+// a terminal state, returning a *JobError if it failed or was aborted.
+func (c *Client) waitForJob(
+	ctx context.Context, kind, id string, status func(context.Context) (JobState, string, error),
+) error {
 	interval := c.pollInterval
 	for {
-		job, err := c.GetQueryJob(ctx, id)
+		state, message, err := status(ctx)
 		if err != nil {
-			return QueryJob{}, err
+			return err
 		}
-		switch job.State {
+		switch state {
 		case JobComplete:
-			return job, nil
+			return nil
 		case JobFailed, JobAborted:
-			return job, &JobError{JobID: id, State: job.State, Message: job.ErrorMessage}
+			return &JobError{JobID: id, State: state, Message: message}
 		}
 
-		c.log.Debug("waiting for query job", zap.String("job_id", id),
-			zap.String("state", string(job.State)), zap.Duration("delay", interval))
+		c.log.Debug("waiting for bulk job", zap.String("kind", kind), zap.String("job_id", id),
+			zap.String("state", string(state)), zap.Duration("delay", interval))
 		if err := retry.Sleep(ctx, interval); err != nil {
-			return QueryJob{}, fmt.Errorf("wait for query job %s: %w", id, err)
+			return fmt.Errorf("wait for %s job %s: %w", kind, id, err)
 		}
 		interval = min(2*interval, c.pollMaxInterval)
 	}

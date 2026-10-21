@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
@@ -176,22 +177,72 @@ func TestExportEndToEnd(t *testing.T) {
 	location := resp.Header.Get("Location")
 	require.NotEmpty(t, location)
 
-	var run struct {
-		Status    string `json:"status"`
-		RecordsOK int    `json:"records_ok"`
-		Error     string `json:"error"`
-	}
-	require.Eventually(t, func() bool {
-		status, body := get(t, baseURL+location)
-		require.Equal(t, http.StatusOK, status)
-		require.NoError(t, json.Unmarshal([]byte(body), &run))
-		return run.Status != "queued" && run.Status != "running"
-	}, 30*time.Second, 50*time.Millisecond)
-
+	run := waitForRun(t, baseURL+location)
 	assert.Equal(t, "succeeded", run.Status, run.Error)
 	assert.Equal(t, 3, run.RecordsOK)
 	_, metrics := get(t, baseURL+"/metrics")
 	assert.Contains(t, metrics, `sync_records_total{direction="export",object="Account"} 3`)
+}
+
+// finishedRun is the part of a run response the end-to-end tests check.
+type finishedRun struct {
+	Status        string `json:"status"`
+	RecordsOK     int    `json:"records_ok"`
+	RecordsFailed int    `json:"records_failed"`
+	Error         string `json:"error"`
+}
+
+// waitForRun polls the run at url until it finishes.
+func waitForRun(t *testing.T, url string) finishedRun {
+	t.Helper()
+	var run finishedRun
+	require.Eventually(t, func() bool {
+		status, body := get(t, url)
+		require.Equal(t, http.StatusOK, status)
+		require.NoError(t, json.Unmarshal([]byte(body), &run))
+		return run.Status != "queued" && run.Status != "running"
+	}, 30*time.Second, 50*time.Millisecond)
+	return run
+}
+
+func TestImportEndToEnd(t *testing.T) {
+	org := sftest.NewServer(t)
+	org.SetDescribe(sftest.Describe{Name: "Account", Fields: []sftest.DescribeField{
+		{Name: "Id", Type: "id"}, {Name: "Name", Type: "string", Createable: true, Updateable: true},
+	}})
+	cfg := testConfig(t, org, sftest.ClientSecret)
+	baseURL, _, _ := startServe(t, cfg, org.HTTPClient())
+	db, err := pgx.Connect(context.Background(), cfg.DatabaseURL)
+	require.NoError(t, err)
+	defer db.Close(context.Background())
+	_, err = db.Exec(context.Background(), `
+		INSERT INTO sf_outbox (object_name, operation, payload) VALUES
+			('Account', 'insert', '{"Name": "Acme"}'),
+			('Account', 'insert', '{"Name": "Globex", "Rating": "Hot"}')`)
+	require.NoError(t, err)
+
+	resp, err := http.Post(baseURL+"/sync/account/import", "", nil)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+
+	run := waitForRun(t, baseURL+resp.Header.Get("Location"))
+	assert.Equal(t, "succeeded", run.Status, run.Error)
+	assert.Equal(t, 1, run.RecordsOK)
+	assert.Equal(t, 1, run.RecordsFailed)
+	require.Len(t, org.IngestJobs(), 1)
+	assert.Equal(t, [][]string{{"Acme"}}, org.IngestJobs()[0].Rows)
+
+	status, body := get(t, baseURL+"/sync/account/dead-letters")
+	assert.Equal(t, http.StatusOK, status)
+	assert.Contains(t, body, `field \"Rating\" does not exist`)
+
+	retry, err := http.Post(baseURL+"/sync/account/dead-letters/retry", "", nil)
+	require.NoError(t, err)
+	defer retry.Body.Close()
+	raw, err := io.ReadAll(retry.Body)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"object": "Account", "requeued": 1}`, string(raw))
 }
 
 func TestRunFailsFast(t *testing.T) {
