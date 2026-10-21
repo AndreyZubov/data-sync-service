@@ -1,9 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # --- build stage ---
-# Runs on the build host's architecture and cross-compiles for the target, which
-# is far faster than building under QEMU emulation for multi-arch images.
-FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+FROM golang:1.27 AS build
 WORKDIR /src
 
 # Cache dependencies first so source edits do not invalidate the download layer.
