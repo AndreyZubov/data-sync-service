@@ -171,7 +171,7 @@ func TestImportReleasesEntriesWhenTheRunFailsBeforeSending(t *testing.T) {
 	assert.Equal(t, outboxState{status: store.Pending}, e.entry(t, id), "nothing was sent, so the attempt does not count")
 }
 
-func TestShutdownCancelsImports(t *testing.T) {
+func TestShutdownSuspendsImports(t *testing.T) {
 	e := newEnv(t, 1)
 	e.org.SetDescribe(contactDescribe)
 	e.org.HoldJobs(true)
@@ -189,9 +189,10 @@ func TestShutdownCancelsImports(t *testing.T) {
 
 	got, err := e.orch.GetRun(context.Background(), run.ID)
 	require.NoError(t, err)
-	assert.Equal(t, store.Cancelled, got.Status)
-	assert.Equal(t, "Aborted", e.org.IngestJobs()[0].State, "the Salesforce job is aborted")
-	assert.Equal(t, outboxState{status: store.Pending}, e.entry(t, id))
+	assert.Equal(t, store.Running, got.Status)
+	assert.Equal(t, "InProgress", e.org.IngestJobs()[0].State, "the Salesforce job is not aborted")
+	assert.Equal(t, outboxState{status: store.Processing, attempts: 1}, e.entry(t, id),
+		"the entry waits for the resumed run to collect its outcome")
 }
 
 func TestScheduledSyncImportsOnlyWhenEntriesAreDue(t *testing.T) {

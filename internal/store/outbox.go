@@ -55,8 +55,12 @@ type OutboxEntry struct {
 	LastError string
 	// SalesforceID is the record's Id, once Salesforce has accepted the entry.
 	SalesforceID string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// BulkJobID is the ingest job the entry was uploaded in while its outcome
+	// is unknown: the next run collects the outcome from that job instead of
+	// uploading the entry again. Empty when the entry is to be uploaded.
+	BulkJobID string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // OutcomeKind classifies what an import run learned about an entry.
@@ -96,10 +100,12 @@ type RetryPolicy struct {
 }
 
 const outboxColumns = `id, object_name, operation, coalesce(external_id_field, ''), payload, status, attempts,
-	coalesce(last_error, ''), coalesce(salesforce_id, ''), created_at, updated_at`
+	coalesce(last_error, ''), coalesce(salesforce_id, ''), coalesce(bulk_job_id, ''), created_at, updated_at`
 
 // ClaimOutbox marks up to limit due pending entries of object as processing
-// by run and returns them, oldest first. It counts the attempt.
+// by run and returns them, oldest first. It counts the attempt. An entry
+// whose BulkJobID is set was uploaded by a run that ended before learning the
+// outcome.
 //
 // Only the oldest pending entry of each record is eligible, so changes to one
 // record reach Salesforce in the order they were written and never share a
@@ -121,7 +127,8 @@ func (s *Store) ClaimOutbox(ctx context.Context, runID int64, object string, lim
 		FROM claimed
 		WHERE o.id = claimed.id
 		RETURNING o.id, o.object_name, o.operation, coalesce(o.external_id_field, ''), o.payload, o.status,
-			o.attempts, coalesce(o.last_error, ''), coalesce(o.salesforce_id, ''), o.created_at, o.updated_at`,
+			o.attempts, coalesce(o.last_error, ''), coalesce(o.salesforce_id, ''), coalesce(o.bulk_job_id, ''),
+			o.created_at, o.updated_at`,
 		object, runID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("claim outbox entries of %s: %w", object, err)
@@ -133,6 +140,50 @@ func (s *Store) ClaimOutbox(ctx context.Context, runID int64, object string, lim
 	// UPDATE ... RETURNING yields rows in no particular order.
 	slices.SortFunc(entries, func(a, b OutboxEntry) int { return cmp.Compare(a.ID, b.ID) })
 	return entries, nil
+}
+
+// RunOutbox returns the entries run still has in processing, oldest first,
+// for resuming the run.
+func (s *Store) RunOutbox(ctx context.Context, runID int64) ([]OutboxEntry, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+outboxColumns+` FROM sf_outbox
+		WHERE run_id = $1 AND status = 'processing'
+		ORDER BY id`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list outbox entries of run %d: %w", runID, err)
+	}
+	entries, err := pgx.CollectRows(rows, scanOutboxEntry)
+	if err != nil {
+		return nil, fmt.Errorf("list outbox entries of run %d: %w", runID, err)
+	}
+	return entries, nil
+}
+
+// AssignIngestJob records that run is uploading entries in the ingest job
+// jobID, which also becomes the run's latest job. It must be stored before
+// the upload, so a resumed run knows where the entries went.
+func (s *Store) AssignIngestJob(ctx context.Context, runID int64, jobID string, entryIDs []int64) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE sf_outbox SET bulk_job_id = $3, updated_at = now()
+			WHERE id = ANY($2) AND run_id = $1 AND status = 'processing'`, runID, entryIDs, jobID)
+		if err != nil {
+			return fmt.Errorf("assign ingest job %s: %w", jobID, err)
+		}
+		if tag.RowsAffected() != int64(len(entryIDs)) {
+			return fmt.Errorf("assign ingest job %s: %d of %d entries are not processing in run %d",
+				jobID, int64(len(entryIDs))-tag.RowsAffected(), len(entryIDs), runID)
+		}
+		tag, err = tx.Exec(ctx, `UPDATE sync_runs SET bulk_job_id = $2 WHERE id = $1 AND owner = $3`,
+			runID, jobID, s.instance)
+		if err != nil {
+			return fmt.Errorf("assign ingest job %s: %w", jobID, err)
+		}
+		if tag.RowsAffected() != 1 {
+			return fmt.Errorf("assign ingest job %s to run %d: %w", jobID, runID, errRunState)
+		}
+		return nil
+	})
 }
 
 // HasDueOutbox reports whether object has a pending entry ready to be sent.
@@ -187,18 +238,22 @@ func (s *Store) RecordOutcomes(ctx context.Context, runID int64, outcomes []Outc
 					WHEN r.kind = $6 THEN now() + least($8 * power(2, o.attempts - 1), $9) * interval '1 microsecond'
 					ELSE o.next_attempt_at
 				END,
+				-- A retry is a fresh upload; the other outcomes keep the job
+				-- for reference.
+				bulk_job_id = CASE WHEN r.kind = $6 THEN NULL ELSE o.bulk_job_id END,
 				updated_at = now()
 			FROM unnest($1::bigint[], $2::bigint[], $3::text[], $4::text[]) AS r(id, kind, sf_id, error)
-			WHERE o.id = r.id AND o.run_id = $10 AND o.status = 'processing'`,
+			WHERE o.id = r.id AND o.run_id = $10 AND o.status = 'processing'
+				AND EXISTS (SELECT 1 FROM sync_runs sr WHERE sr.id = $10 AND sr.owner = $11)`,
 			ids, kinds, sfIDs, errMsg,
 			int64(Delivered), int64(Retry), policy.MaxAttempts,
-			float64(policy.BaseDelay.Microseconds()), float64(policy.MaxDelay.Microseconds()), runID)
+			float64(policy.BaseDelay.Microseconds()), float64(policy.MaxDelay.Microseconds()), runID, s.instance)
 		if err != nil {
 			return fmt.Errorf("record outbox outcomes: %w", err)
 		}
 		if tag.RowsAffected() != int64(len(outcomes)) {
-			return fmt.Errorf("record outbox outcomes: %d of %d entries are not processing in run %d",
-				int64(len(outcomes))-tag.RowsAffected(), len(outcomes), runID)
+			return fmt.Errorf("record outbox outcomes: %d of %d entries are not processing in run %d, "+
+				"or the run is leased by another instance", int64(len(outcomes))-tag.RowsAffected(), len(outcomes), runID)
 		}
 
 		if err := tx.QueryRow(ctx, `
@@ -216,17 +271,11 @@ func (s *Store) RecordOutcomes(ctx context.Context, runID int64, outcomes []Outc
 	return dead, err
 }
 
-// ReleaseOutbox returns the entries a run still has in processing to pending,
-// without counting the attempt, for runs that stop before learning the
-// entries' outcome. It returns the number of entries released.
-func (s *Store) ReleaseOutbox(ctx context.Context, runID int64) (int64, error) {
-	tag, err := s.pool.Exec(ctx, releaseOutboxSQL+` AND run_id = $1`, runID)
-	if err != nil {
-		return 0, fmt.Errorf("release outbox entries of run %d: %w", runID, err)
-	}
-	return tag.RowsAffected(), nil
-}
-
+// releaseOutboxSQL returns entries still in processing to pending, without
+// counting the attempt, for runs that end before learning their outcome.
+// Entries keep the ingest job they were uploaded in, so the next run collects
+// their outcome from it rather than uploading them again. Callers narrow it
+// down to the runs concerned.
 const releaseOutboxSQL = `
 	UPDATE sf_outbox SET status = 'pending', attempts = greatest(attempts - 1, 0), updated_at = now()
 	WHERE status = 'processing'`
@@ -249,11 +298,13 @@ func (s *Store) DeadLetters(ctx context.Context, object string, limit int) ([]Ou
 }
 
 // RetryDeadLetters returns every dead-lettered entry of object to pending
-// with a fresh set of attempts, for after the cause has been fixed. It
-// returns the number of entries requeued.
+// with a fresh set of attempts, for after the cause has been fixed. The
+// entries are uploaded again, even those whose earlier outcome was unknown.
+// It returns the number of entries requeued.
 func (s *Store) RetryDeadLetters(ctx context.Context, object string) (int64, error) {
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE sf_outbox SET status = 'pending', attempts = 0, next_attempt_at = now(), updated_at = now()
+		UPDATE sf_outbox SET status = 'pending', attempts = 0, next_attempt_at = now(), bulk_job_id = NULL,
+			updated_at = now()
 		WHERE object_name = $1 AND status = 'dead'`, object)
 	if err != nil {
 		return 0, fmt.Errorf("retry dead letters of %s: %w", object, err)
@@ -264,6 +315,6 @@ func (s *Store) RetryDeadLetters(ctx context.Context, object string) (int64, err
 func scanOutboxEntry(row pgx.CollectableRow) (OutboxEntry, error) {
 	var e OutboxEntry
 	err := row.Scan(&e.ID, &e.Object, &e.Operation, &e.ExternalIDField, &e.Payload, &e.Status, &e.Attempts,
-		&e.LastError, &e.SalesforceID, &e.CreatedAt, &e.UpdatedAt)
+		&e.LastError, &e.SalesforceID, &e.BulkJobID, &e.CreatedAt, &e.UpdatedAt)
 	return e, err
 }

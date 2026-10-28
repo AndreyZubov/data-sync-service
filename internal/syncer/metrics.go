@@ -11,6 +11,7 @@ type metrics struct {
 	deadLetters *prometheus.CounterVec
 	duration    *prometheus.HistogramVec
 	active      prometheus.Gauge
+	resumed     *prometheus.CounterVec
 }
 
 func newMetrics(reg prometheus.Registerer) *metrics {
@@ -41,7 +42,11 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Name: "sync_active_runs",
 			Help: "Sync runs currently executing.",
 		}),
+		resumed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sync_runs_resumed_total",
+			Help: "Runs resumed after a service restart, by object and direction.",
+		}, []string{"object", "direction"}),
 	}
-	reg.MustRegister(m.runs, m.records, m.failures, m.deadLetters, m.duration, m.active)
+	reg.MustRegister(m.runs, m.records, m.failures, m.deadLetters, m.duration, m.active, m.resumed)
 	return m
 }

@@ -70,19 +70,25 @@ func TestQueryJobLifecycle(t *testing.T) {
 	assert.Equal(t, JobComplete, done.State)
 	assert.EqualValues(t, 3, done.NumberRecordsProcessed)
 
-	var rows [][]string
-	pages := 0
-	err = c.StreamQueryResults(ctx, job.ID, func(body io.Reader) error {
-		pages++
-		records, err := csv.NewReader(body).ReadAll()
+	read := func(from string) (rows [][]string, next []string) {
+		err := c.StreamQueryResults(ctx, job.ID, from, func(body io.Reader, locator string) error {
+			records, err := csv.NewReader(body).ReadAll()
+			require.NoError(t, err)
+			require.Equal(t, []string{"Id", "Name"}, records[0], "every page starts with the header")
+			rows = append(rows, records[1:]...)
+			next = append(next, locator)
+			return nil
+		})
 		require.NoError(t, err)
-		require.Equal(t, []string{"Id", "Name"}, records[0], "every page starts with the header")
-		rows = append(rows, records[1:]...)
-		return nil
-	})
-	require.NoError(t, err)
-	assert.Equal(t, 2, pages)
+		return rows, next
+	}
+	rows, next := read("")
 	assert.Equal(t, [][]string{{"001A", "Acme"}, {"001B", "Globex, Inc."}, {"001C", "Initech"}}, rows)
+	assert.Equal(t, []string{"2", ""}, next, "each page names the next one; the last names none")
+
+	rows, next = read("2")
+	assert.Equal(t, [][]string{{"001C", "Initech"}}, rows, "a download resumes at a page's locator")
+	assert.Equal(t, []string{""}, next)
 
 	jobs := org.QueryJobs()
 	require.Len(t, jobs, 1)
@@ -105,7 +111,7 @@ func TestStreamQueryResultsStopsOnCallbackError(t *testing.T) {
 
 	stop := errors.New("stop")
 	calls := 0
-	err = c.StreamQueryResults(ctx, job.ID, func(io.Reader) error {
+	err = c.StreamQueryResults(ctx, job.ID, "", func(io.Reader, string) error {
 		calls++
 		return stop
 	})
@@ -120,7 +126,7 @@ func TestStreamQueryResultsOfIncompleteJob(t *testing.T) {
 	job, err := c.CreateQueryJob(context.Background(), Query, "SELECT Id FROM Account")
 	require.NoError(t, err)
 
-	err = c.StreamQueryResults(context.Background(), job.ID, func(io.Reader) error { return nil })
+	err = c.StreamQueryResults(context.Background(), job.ID, "", func(io.Reader, string) error { return nil })
 
 	var apiErr *APIError
 	require.ErrorAs(t, err, &apiErr)
@@ -177,7 +183,7 @@ func TestWaitForQueryJobRespectsTheContext(t *testing.T) {
 
 func TestJobStateTerminal(t *testing.T) {
 	for state, want := range map[JobState]bool{
-		JobUploadComplete: false, JobInProgress: false,
+		JobOpen: false, JobUploadComplete: false, JobInProgress: false,
 		JobComplete: true, JobFailed: true, JobAborted: true,
 	} {
 		assert.Equal(t, want, state.Terminal(), state)

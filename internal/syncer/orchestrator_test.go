@@ -46,7 +46,20 @@ func newEnv(t *testing.T, maxConcurrent int) *env {
 	db := storetest.New(t)
 	org := sftest.NewServer(t)
 	org.SetDescribe(accountDescribe)
+	return newEnvOn(t, org, db, Config{MaxConcurrentRuns: maxConcurrent})
+}
 
+// restart returns an env with a new orchestrator on e's org and database, as
+// after a service restart.
+func (e *env) restart(t *testing.T) *env {
+	t.Helper()
+	return newEnvOn(t, e.org, e.db, Config{MaxConcurrentRuns: cap(e.orch.slots)})
+}
+
+// newEnvOn wires an orchestrator to org and db. cfg supplies the settings
+// tests vary; the rest are filled in.
+func newEnvOn(t *testing.T, org *sftest.Server, db *storetest.DB, cfg Config) *env {
+	t.Helper()
 	tokens := salesforce.NewClientCredentials(salesforce.ClientCredentialsConfig{
 		LoginURL:     org.URL(),
 		ClientID:     sftest.ClientID,
@@ -65,15 +78,9 @@ func newEnv(t *testing.T, maxConcurrent int) *env {
 		JobPollMaxInterval: 5 * time.Millisecond,
 	})
 	reg := prometheus.NewRegistry()
-	orch := New(Config{
-		Salesforce:        sf,
-		Store:             db.Store,
-		Workers:           3,
-		MaxConcurrentRuns: maxConcurrent,
-		BatchSize:         2,
-		Logger:            log,
-		Registerer:        reg,
-	})
+	cfg.Salesforce, cfg.Store, cfg.Logger, cfg.Registerer = sf, db.Store, log, reg
+	cfg.Workers, cfg.BatchSize = 3, 2
+	orch := New(cfg)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -304,7 +311,7 @@ func TestConcurrentRunsAreCapped(t *testing.T) {
 	assert.Equal(t, store.Succeeded, e.waitForStatus(t, contact.ID, store.Succeeded).Status)
 }
 
-func TestShutdownCancelsActiveRuns(t *testing.T) {
+func TestShutdownSuspendsRunsWithAJobAndCancelsTheRest(t *testing.T) {
 	e := newEnv(t, 1)
 	e.org.SetDescribe(sftest.Describe{Name: "Contact", Queryable: true, Fields: []sftest.DescribeField{{Name: "Id", Type: "id"}}})
 	e.org.HoldJobs(true)
@@ -319,16 +326,19 @@ func TestShutdownCancelsActiveRuns(t *testing.T) {
 	defer cancel()
 	require.NoError(t, e.orch.Shutdown(ctx))
 
-	for _, id := range []int64{running.ID, queued.ID} {
-		run, err := e.orch.GetRun(context.Background(), id)
-		require.NoError(t, err)
-		assert.Equal(t, store.Cancelled, run.Status)
-	}
-	assert.Equal(t, "Aborted", e.org.QueryJobs()[0].State, "the Salesforce job is aborted")
+	got, err := e.orch.GetRun(context.Background(), running.ID)
+	require.NoError(t, err)
+	assert.Equal(t, store.Running, got.Status, "the run waits to be resumed")
+	assert.Empty(t, got.Owner, "any instance may resume it")
+	assert.NotEqual(t, "Aborted", e.org.QueryJobs()[0].State, "the Salesforce job keeps running")
+	got, err = e.orch.GetRun(context.Background(), queued.ID)
+	require.NoError(t, err)
+	assert.Equal(t, store.Cancelled, got.Status, "a run without a job has nothing to resume")
 
 	_, err = e.orch.StartExport(context.Background(), "Account", store.Manual, false)
 	assert.ErrorIs(t, err, ErrShuttingDown)
 	assert.ErrorIs(t, e.orch.Schedule(nil), ErrShuttingDown)
+	assert.ErrorIs(t, e.orch.RecoverInterruptedRuns(context.Background()), ErrShuttingDown)
 }
 
 func TestShutdownGivesUpAtTheDeadline(t *testing.T) {
@@ -386,6 +396,8 @@ func TestScheduledExportSkipsWhileARunIsActive(t *testing.T) {
 func TestRecoverInterruptedRuns(t *testing.T) {
 	e := newEnv(t, 1)
 	stale, err := e.db.Store.CreateRun(context.Background(), "Account", store.Export, store.Manual, false)
+	require.NoError(t, err)
+	_, err = e.db.Pool.Exec(context.Background(), `UPDATE sync_runs SET owner = 'crashed', heartbeat_at = NULL`)
 	require.NoError(t, err)
 
 	require.NoError(t, e.orch.RecoverInterruptedRuns(context.Background()))

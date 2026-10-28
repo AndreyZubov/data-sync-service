@@ -21,6 +21,10 @@ const (
 	APIVersion   = "60.0"
 )
 
+// defaultAPIMax is the org's daily API request allocation until a test sets
+// another with SetAPIUsage.
+const defaultAPIMax = 15000
+
 // Server is a fake Salesforce org. Create it with NewServer.
 type Server struct {
 	srv *httptest.Server
@@ -32,12 +36,16 @@ type Server struct {
 	tokenRequests int
 	tokenOverride *tokenOverride
 
-	describes map[string]Describe
-	onQuery   QueryFunc
-	pageSize  int
-	holdJobs  bool
-	jobs      map[string]*queryJob
-	jobOrder  []string
+	apiUsed, apiMax int
+	intercept       func(w http.ResponseWriter, r *http.Request) bool
+
+	describes  map[string]Describe
+	onQuery    QueryFunc
+	pageSize   int
+	holdJobs   bool
+	jobs       map[string]*queryJob
+	jobOrder   []string
+	beforePage func(r *http.Request, jobID, locator string)
 
 	onIngest      IngestFunc
 	ingestFailure string
@@ -58,11 +66,13 @@ func NewServer(t testing.TB) *Server {
 		mux:         http.NewServeMux(),
 		validTokens: make(map[string]bool),
 		describes:   make(map[string]Describe),
+		apiMax:      defaultAPIMax,
 		pageSize:    defaultPageSize,
 		jobs:        make(map[string]*queryJob),
 		ingestJobs:  make(map[string]*ingestJob),
 	}
 	s.mux.HandleFunc("POST /services/oauth2/token", s.handleToken)
+	s.Handle("GET /limits", s.handleLimits)
 	s.Handle("GET /sobjects/{object}/describe", s.handleDescribe)
 	s.Handle("POST /jobs/query", s.handleCreateQueryJob)
 	s.Handle("GET /jobs/query/{id}", s.handleGetQueryJob)
@@ -96,6 +106,23 @@ func (s *Server) Handle(pattern string, h http.HandlerFunc) {
 		panic(fmt.Sprintf("sftest: pattern %q must be \"METHOD /path\"", pattern))
 	}
 	s.mux.HandleFunc(method+" /services/data/v"+APIVersion+path, s.requireToken(h))
+}
+
+// SetAPIUsage sets the org's API usage, which every data API response
+// reports in its Sforce-Limit-Info header and GET /limits returns.
+func (s *Server) SetAPIUsage(used, limit int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.apiUsed, s.apiMax = used, limit
+}
+
+// Intercept sets a function that sees every authenticated data API request
+// first and answers it itself by returning true, for injecting failures into
+// any route. nil removes it.
+func (s *Server) Intercept(fn func(w http.ResponseWriter, r *http.Request) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.intercept = fn
 }
 
 // TokenRequests returns how many token requests the org has received.
@@ -174,8 +201,23 @@ func (s *Server) requireToken(h http.HandlerFunc) http.HandlerFunc {
 			WriteError(w, http.StatusUnauthorized, "INVALID_SESSION_ID", "Session expired or invalid")
 			return
 		}
+		s.mu.Lock()
+		w.Header().Set("Sforce-Limit-Info", fmt.Sprintf("api-usage=%d/%d", s.apiUsed, s.apiMax))
+		intercept := s.intercept
+		s.mu.Unlock()
+		if intercept != nil && intercept(w, r) {
+			return
+		}
 		h(w, r)
 	}
+}
+
+func (s *Server) handleLimits(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"DailyApiRequests": map[string]int{"Max": s.apiMax, "Remaining": s.apiMax - s.apiUsed},
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -112,28 +112,28 @@ func TestDoJSONWithoutBodies(t *testing.T) {
 
 func TestDoJSONReportsUndecodableResponse(t *testing.T) {
 	org := sftest.NewServer(t)
-	org.Handle("GET /limits", func(w http.ResponseWriter, _ *http.Request) {
+	org.Handle("GET /sobjects", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("not json"))
 	})
 	c := newTestClient(t, org)
 
 	var out map[string]any
-	err := c.DoJSON(context.Background(), http.MethodGet, "/limits", nil, &out)
+	err := c.DoJSON(context.Background(), http.MethodGet, "/sobjects", nil, &out)
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "decode GET /limits response")
+	assert.Contains(t, err.Error(), "decode GET /sobjects response")
 }
 
 func TestDoReauthenticatesOnceAfterRevokedSession(t *testing.T) {
 	org := sftest.NewServer(t)
 	handler, calls := sequence()
-	org.Handle("GET /limits", handler)
+	org.Handle("GET /sobjects", handler)
 	c := newTestClient(t, org)
 	ctx := context.Background()
 
-	require.NoError(t, c.DoJSON(ctx, http.MethodGet, "/limits", nil, nil))
+	require.NoError(t, c.DoJSON(ctx, http.MethodGet, "/sobjects", nil, nil))
 	org.RevokeTokens()
-	require.NoError(t, c.DoJSON(ctx, http.MethodGet, "/limits", nil, nil))
+	require.NoError(t, c.DoJSON(ctx, http.MethodGet, "/sobjects", nil, nil))
 
 	assert.Equal(t, 2, org.TokenRequests(), "one token per session")
 	assert.EqualValues(t, 2, calls.Load(), "the rejected request never reached the handler")
@@ -142,10 +142,10 @@ func TestDoReauthenticatesOnceAfterRevokedSession(t *testing.T) {
 func TestDoGivesUpWhenAFreshTokenIsAlsoRejected(t *testing.T) {
 	org := sftest.NewServer(t)
 	handler, calls := sequence(http.StatusUnauthorized, http.StatusUnauthorized, http.StatusUnauthorized)
-	org.Handle("GET /limits", handler)
+	org.Handle("GET /sobjects", handler)
 	c := newTestClient(t, org)
 
-	err := c.DoJSON(context.Background(), http.MethodGet, "/limits", nil, nil)
+	err := c.DoJSON(context.Background(), http.MethodGet, "/sobjects", nil, nil)
 
 	var apiErr *APIError
 	require.ErrorAs(t, err, &apiErr)
@@ -197,7 +197,7 @@ func TestDoHonoursRetryAfter(t *testing.T) {
 	t.Run("within the policy", func(t *testing.T) {
 		org := sftest.NewServer(t)
 		var calls atomic.Int32
-		org.Handle("GET /limits", func(w http.ResponseWriter, _ *http.Request) {
+		org.Handle("GET /sobjects", func(w http.ResponseWriter, _ *http.Request) {
 			if calls.Add(1) == 1 {
 				w.Header().Set("Retry-After", "0")
 				w.WriteHeader(http.StatusTooManyRequests)
@@ -206,20 +206,20 @@ func TestDoHonoursRetryAfter(t *testing.T) {
 			_, _ = w.Write([]byte(`{}`))
 		})
 
-		require.NoError(t, newTestClient(t, org).DoJSON(context.Background(), http.MethodGet, "/limits", nil, nil))
+		require.NoError(t, newTestClient(t, org).DoJSON(context.Background(), http.MethodGet, "/sobjects", nil, nil))
 		assert.EqualValues(t, 2, calls.Load())
 	})
 
 	t.Run("beyond the policy gives up", func(t *testing.T) {
 		org := sftest.NewServer(t)
 		var calls atomic.Int32
-		org.Handle("GET /limits", func(w http.ResponseWriter, _ *http.Request) {
+		org.Handle("GET /sobjects", func(w http.ResponseWriter, _ *http.Request) {
 			calls.Add(1)
 			w.Header().Set("Retry-After", "3600")
 			w.WriteHeader(http.StatusServiceUnavailable)
 		})
 
-		err := newTestClient(t, org).DoJSON(context.Background(), http.MethodGet, "/limits", nil, nil)
+		err := newTestClient(t, org).DoJSON(context.Background(), http.MethodGet, "/sobjects", nil, nil)
 
 		var apiErr *APIError
 		require.ErrorAs(t, err, &apiErr)
@@ -268,14 +268,14 @@ func TestDoRetriesNetworkErrorsOnlyForIdempotentMethods(t *testing.T) {
 		t.Run(tt.method, func(t *testing.T) {
 			org := sftest.NewServer(t)
 			var calls atomic.Int32
-			org.Handle(tt.method+" /limits", func(w http.ResponseWriter, _ *http.Request) {
+			org.Handle(tt.method+" /sobjects", func(w http.ResponseWriter, _ *http.Request) {
 				if calls.Add(1) == 1 {
 					panic(http.ErrAbortHandler) // drops the connection mid-request
 				}
 				_, _ = w.Write([]byte(`{}`))
 			})
 
-			err := newTestClient(t, org).DoJSON(context.Background(), tt.method, "/limits", nil, nil)
+			err := newTestClient(t, org).DoJSON(context.Background(), tt.method, "/sobjects", nil, nil)
 
 			assert.Equal(t, tt.wantCalls, calls.Load())
 			if tt.wantErr {
@@ -292,7 +292,7 @@ func TestDoRetriesNetworkErrorsOnlyForIdempotentMethods(t *testing.T) {
 func TestDoStopsRetryingWhenTheContextEnds(t *testing.T) {
 	org := sftest.NewServer(t)
 	handler, _ := sequence(503, 503, 503)
-	org.Handle("GET /limits", handler)
+	org.Handle("GET /sobjects", handler)
 	tokens, _ := newProvider(org, time.Hour)
 	c := NewClient(ClientConfig{
 		Tokens:     tokens,
@@ -303,7 +303,7 @@ func TestDoStopsRetryingWhenTheContextEnds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	err := c.DoJSON(ctx, http.MethodGet, "/limits", nil, nil)
+	err := c.DoJSON(ctx, http.MethodGet, "/sobjects", nil, nil)
 
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
@@ -313,7 +313,7 @@ func TestDoReportsTokenFailures(t *testing.T) {
 	org.OverrideTokenResponse(http.StatusBadRequest, `{"error":"invalid_client","error_description":"bad"}`)
 	c := newTestClient(t, org)
 
-	err := c.DoJSON(context.Background(), http.MethodGet, "/limits", nil, nil)
+	err := c.DoJSON(context.Background(), http.MethodGet, "/sobjects", nil, nil)
 
 	var authErr *AuthError
 	require.ErrorAs(t, err, &authErr)

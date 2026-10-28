@@ -1,16 +1,25 @@
 package syncer
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"net/http"
+	"slices"
+	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/AndreyZubov/data-sync-service/internal/salesforce"
 	"github.com/AndreyZubov/data-sync-service/internal/store"
 )
+
+// abortTimeout bounds the best-effort abort of an ingest job the run will
+// not see through.
+const abortTimeout = 10 * time.Second
 
 // importer sends outbox entries of one object to Salesforce.
 type importer struct {
@@ -23,14 +32,22 @@ type importer struct {
 
 // importRun claims due outbox entries of run's object and sends them through
 // one ingest job per operation, or more if an upload would exceed the size
-// limit. Each job's outcomes are recorded as soon as it finishes, so a later
-// failure loses no progress. Entries whose outcome is still unknown when the
-// run stops go back to pending.
+// limit. A resumed run instead finishes the entries it had already claimed.
+// Each job's outcomes are recorded as soon as it finishes, so a later
+// failure loses no progress.
 //
 // A job that fails as a whole leaves its entries to be retried and fails the
-// run, but the remaining jobs are still sent.
+// run, but the remaining jobs are still sent. If ctx is cancelled, a job in
+// progress is left running, so that the run can be resumed when the service
+// starts again.
 func (im *importer) importRun(ctx context.Context, run store.Run, log *zap.Logger) error {
-	entries, err := im.store.ClaimOutbox(ctx, run.ID, run.Object, im.maxRecords)
+	var entries []store.OutboxEntry
+	var err error
+	if run.Resumes > 0 {
+		entries, err = im.store.RunOutbox(ctx, run.ID)
+	} else {
+		entries, err = im.store.ClaimOutbox(ctx, run.ID, run.Object, im.maxRecords)
+	}
 	if err != nil {
 		return err
 	}
@@ -38,49 +55,157 @@ func (im *importer) importRun(ctx context.Context, run store.Run, log *zap.Logge
 		log.Info("outbox has no due entries")
 		return nil
 	}
-	log.Info("outbox entries claimed", zap.Int("entries", len(entries)))
-	defer im.release(ctx, run.ID, log)
+	log.Info("outbox entries claimed", zap.Int("entries", len(entries)), zap.Int("resumes", run.Resumes))
 
 	desc, err := im.sf.Describe(ctx, run.Object)
 	if err != nil {
 		return err
 	}
+	return im.process(ctx, run, desc, entries, log)
+}
 
+// process finishes entries: those already uploaded in an ingest job, by a
+// resumed run or by a run that ended before learning their outcome, get that
+// job's outcome, and the rest are sent now.
+func (im *importer) process(
+	ctx context.Context, run store.Run, desc *salesforce.ObjectDescription, entries []store.OutboxEntry, log *zap.Logger,
+) error {
+	var unsent []store.OutboxEntry
+	byJob := make(map[string][]store.OutboxEntry)
+	var jobIDs []string
+	for _, e := range entries {
+		if e.BulkJobID == "" {
+			unsent = append(unsent, e)
+			continue
+		}
+		if _, seen := byJob[e.BulkJobID]; !seen {
+			jobIDs = append(jobIDs, e.BulkJobID)
+		}
+		byJob[e.BulkJobID] = append(byJob[e.BulkJobID], e)
+	}
+
+	var jobErrs []error
+	for _, id := range jobIDs {
+		outcomes, again, err := im.recover(ctx, desc, id, byJob[id], log.With(zap.String("bulk_job_id", id)))
+		if recErr := im.record(ctx, run, outcomes, log); recErr != nil {
+			return errors.Join(err, recErr)
+		}
+		var jobErr *salesforce.JobError
+		if errors.As(err, &jobErr) {
+			jobErrs = append(jobErrs, err)
+		} else if err != nil {
+			return err
+		}
+		unsent = append(unsent, again...)
+	}
+
+	// Entries of one record must still go out oldest first.
+	slices.SortFunc(unsent, func(a, b store.OutboxEntry) int { return cmp.Compare(a.ID, b.ID) })
+	more, err := im.sendAll(ctx, run, desc, unsent, log)
+	if err != nil {
+		return err
+	}
+	return jobFailures(append(jobErrs, more...))
+}
+
+// recover returns the outcomes of entries uploaded earlier in the ingest job
+// jobID, waiting for the job if it is still in progress. Entries Salesforce
+// never received are returned for sending again.
+func (im *importer) recover(
+	ctx context.Context, desc *salesforce.ObjectDescription, jobID string, entries []store.OutboxEntry, log *zap.Logger,
+) (outcomes []store.Outcome, unsent []store.OutboxEntry, err error) {
+	job, err := im.sf.GetIngestJob(ctx, jobID)
+	var apiErr *salesforce.APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+		log.Warn("earlier ingest job no longer exists; its outcomes are unknown")
+		for _, e := range entries {
+			outcomes = append(outcomes, store.Outcome{
+				EntryID: e.ID, Kind: store.Rejected,
+				Error: fmt.Sprintf("the result of ingest job %s is no longer available", jobID),
+			})
+		}
+		return outcomes, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	switch {
+	case job.State == salesforce.JobOpen:
+		// Salesforce processes nothing before the upload is marked complete,
+		// so the entries can safely go out in a new job.
+		log.Info("earlier ingest job was never closed; sending its entries again")
+		im.abort(ctx, jobID, log)
+		return nil, entries, nil
+	case job.State == salesforce.JobAborted && job.NumberRecordsProcessed == 0:
+		// A run that failed to upload aborts its job before ending.
+		log.Info("earlier ingest job was aborted before processing anything; sending its entries again")
+		return nil, entries, nil
+	}
+
+	// Planning the same entries again yields the CSV the job was given, which
+	// is what its results are matched against.
+	g := &ingestGroup{operation: entries[0].Operation, externalIDField: entries[0].ExternalIDField, entries: entries}
+	plan, err := planIngest(desc, g, math.MaxInt)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, r := range plan.rejected {
+		// The entry was uploaded but no longer passes the object's describe
+		// result, so its row cannot be rebuilt to match its result.
+		outcomes = append(outcomes, store.Outcome{EntryID: r.EntryID, Kind: store.Rejected, Error: errNoResult})
+	}
+	if len(plan.batches) == 0 {
+		return outcomes, nil, nil
+	}
+	log.Info("collecting the outcomes of an earlier ingest job", zap.String("state", string(job.State)))
+	more, err := im.finish(ctx, jobID, plan.batches[0], log)
+	return append(outcomes, more...), nil, err
+}
+
+// sendAll sends entries through as many ingest jobs as they need and records
+// the outcomes. It returns the errors of jobs that failed as a whole, which
+// do not stop the remaining jobs, and any other error, which does.
+func (im *importer) sendAll(
+	ctx context.Context, run store.Run, desc *salesforce.ObjectDescription, entries []store.OutboxEntry, log *zap.Logger,
+) ([]error, error) {
 	var jobErrs []error
 	for _, g := range groupEntries(entries) {
 		plan, err := planIngest(desc, g, salesforce.MaxIngestUpload)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := im.record(ctx, run, plan.rejected, log); err != nil {
-			return err
+			return nil, err
 		}
 		for _, b := range plan.batches {
-			// A cancelled send may still return the outcomes it salvaged.
 			outcomes, err := im.send(ctx, run, g, b, log)
 			if recErr := im.record(ctx, run, outcomes, log); recErr != nil {
-				return errors.Join(err, recErr)
+				return nil, errors.Join(err, recErr)
 			}
 			var jobErr *salesforce.JobError
 			if errors.As(err, &jobErr) {
 				jobErrs = append(jobErrs, err)
 			} else if err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
-	if len(jobErrs) > 0 {
-		return fmt.Errorf("%d of the run's ingest jobs failed: %w", len(jobErrs), errors.Join(jobErrs...))
+	return jobErrs, nil
+}
+
+// jobFailures summarises the errors of ingest jobs that failed as a whole.
+func jobFailures(errs []error) error {
+	if len(errs) == 0 {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("%d of the run's ingest jobs failed: %w", len(errs), errors.Join(errs...))
 }
 
 // send uploads b as one ingest job and returns the outcome of each of its
-// entries. A job that failed as a whole is reported as a *JobError alongside
-// outcomes that retry its unprocessed entries. If ctx is cancelled while the
-// job runs, the job is aborted and the outcomes of the records it had already
-// processed are returned with the error. Entries without an outcome stay
-// undecided.
+// entries. The entries are assigned to the job before the upload, so a
+// resumed run can find their outcome. A job that failed as a whole is
+// reported as a *JobError alongside outcomes that retry its unprocessed
+// entries.
 func (im *importer) send(ctx context.Context, run store.Run, g *ingestGroup, b *ingestBatch, log *zap.Logger) ([]store.Outcome, error) {
 	job, err := im.sf.CreateIngestJob(ctx, run.Object, salesforce.IngestOperation(g.operation), g.externalIDField)
 	if err != nil {
@@ -88,26 +213,39 @@ func (im *importer) send(ctx context.Context, run store.Run, g *ingestGroup, b *
 	}
 	log = log.With(zap.String("bulk_job_id", job.ID))
 	log.Info("ingest job created", zap.String("operation", string(g.operation)), zap.Int("records", len(b.rows)))
-	if err := im.store.SetBulkJob(ctx, run.ID, job.ID); err != nil {
+	if err := im.store.AssignIngestJob(ctx, run.ID, job.ID, b.entryIDs); err != nil {
 		im.abort(ctx, job.ID, log)
 		return nil, err
 	}
-	if err := im.sf.UploadIngestData(ctx, job.ID, b.data); err != nil {
-		im.abort(ctx, job.ID, log)
+	if err := im.upload(ctx, job.ID, b.data); err != nil {
+		// A cancelled run leaves the job for its resumption to deal with: a
+		// close request may have reached Salesforce even so.
+		if ctx.Err() == nil {
+			im.abort(ctx, job.ID, log)
+		}
 		return nil, err
 	}
-	if err := im.sf.CloseIngestJob(ctx, job.ID); err != nil {
-		im.abort(ctx, job.ID, log)
-		return nil, err
-	}
+	return im.finish(ctx, job.ID, b, log)
+}
 
-	done, err := im.sf.WaitForIngestJob(ctx, job.ID)
+// upload sends data to an open ingest job and marks the upload complete.
+func (im *importer) upload(ctx context.Context, jobID string, data []byte) error {
+	if err := im.sf.UploadIngestData(ctx, jobID, data); err != nil {
+		return err
+	}
+	return im.sf.CloseIngestJob(ctx, jobID)
+}
+
+// finish waits for an ingest job to end and returns the outcome of each of
+// b's entries. Entries without a result are rejected if the job completed,
+// since Salesforce may have applied them, and retried if it failed as a
+// whole, which is then reported as a *JobError.
+func (im *importer) finish(ctx context.Context, jobID string, b *ingestBatch, log *zap.Logger) ([]store.Outcome, error) {
+	done, err := im.sf.WaitForIngestJob(ctx, jobID)
 	var jobErr *salesforce.JobError
 	switch {
 	case errors.As(err, &jobErr):
 		log.Warn("ingest job did not complete", zap.Error(err))
-	case err != nil && ctx.Err() != nil:
-		return im.salvage(ctx, job.ID, b, log), err
 	case err != nil:
 		return nil, err
 	default:
@@ -115,7 +253,7 @@ func (im *importer) send(ctx context.Context, run store.Run, g *ingestGroup, b *
 			zap.Int64("failed", done.NumberRecordsFailed))
 	}
 
-	outcomes, unmatched, err := im.collect(ctx, job.ID, b)
+	outcomes, unmatched, err := im.collect(ctx, jobID, b)
 	if err != nil {
 		return nil, err
 	}
@@ -131,26 +269,6 @@ func (im *importer) send(ctx context.Context, run store.Run, g *ingestGroup, b *
 		return outcomes, jobErr
 	}
 	return outcomes, nil
-}
-
-// salvage aborts the job of a cancelled run and returns the outcomes of the
-// records Salesforce processed before it stopped, so they are not sent again.
-// It is best effort: any failure leaves every entry undecided.
-func (im *importer) salvage(ctx context.Context, jobID string, b *ingestBatch, log *zap.Logger) []store.Outcome {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abortTimeout)
-	defer cancel()
-	im.abort(ctx, jobID, log)
-	var jobErr *salesforce.JobError
-	if _, err := im.sf.WaitForIngestJob(ctx, jobID); err != nil && !errors.As(err, &jobErr) {
-		log.Warn("wait for aborted ingest job", zap.Error(err))
-		return nil
-	}
-	outcomes, _, err := im.collect(ctx, jobID, b)
-	if err != nil {
-		log.Warn("collect results of aborted ingest job", zap.Error(err))
-		return nil
-	}
-	return outcomes
 }
 
 // collect matches the results of a finished job to b's entries and returns
@@ -210,20 +328,6 @@ func (im *importer) record(ctx context.Context, run store.Run, outcomes []store.
 		log.Warn("outbox entries not delivered", zap.Int("failed", failed), zap.Int64("dead_lettered", dead))
 	}
 	return nil
-}
-
-// release returns the run's undecided entries to pending.
-func (im *importer) release(ctx context.Context, runID int64, log *zap.Logger) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), statusWriteTimeout)
-	defer cancel()
-	n, err := im.store.ReleaseOutbox(ctx, runID)
-	if err != nil {
-		log.Error("release outbox entries", zap.Error(err))
-		return
-	}
-	if n > 0 {
-		log.Warn("outbox entries returned to pending", zap.Int64("entries", n))
-	}
 }
 
 // abort stops an ingest job the run will not see through. Failure is only

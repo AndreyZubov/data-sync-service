@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/AndreyZubov/data-sync-service/internal/salesforce"
 	"github.com/AndreyZubov/data-sync-service/internal/store"
 	"github.com/AndreyZubov/data-sync-service/internal/syncer"
 )
@@ -120,6 +121,15 @@ func TestExportErrors(t *testing.T) {
 			wantBody:   `{"error":"service is shutting down"}`,
 		},
 		{
+			name:   "org API usage above the threshold",
+			target: "/sync/Account/export",
+			err: &syncer.APIUsageError{
+				Usage: salesforce.APIUsage{Used: 13500, Max: 15000}, Threshold: 0.8, RetryAfter: 5 * time.Minute,
+			},
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   `{"error":"the org has used 13500 of 15000 daily API requests (90%), above the 80% threshold"}`,
+		},
+		{
 			name:       "unexpected failure is not exposed",
 			target:     "/sync/Account/export",
 			err:        errors.New("dial tcp 10.0.0.5:5432: connection refused"),
@@ -133,6 +143,10 @@ func TestExportErrors(t *testing.T) {
 
 			assert.Equal(t, tt.wantStatus, rec.Code)
 			assert.JSONEq(t, tt.wantBody, rec.Body.String())
+			var usage *syncer.APIUsageError
+			if errors.As(tt.err, &usage) {
+				assert.Equal(t, "300", rec.Header().Get("Retry-After"))
+			}
 		})
 	}
 }
@@ -146,6 +160,7 @@ func TestGetRun(t *testing.T) {
 	run.BulkJobID = "750xx"
 	run.RecordsOK = 1500
 	run.Error = "bulk job 750xx ended in state Failed"
+	run.Resumes = 1
 	run.StartedAt = &started
 	run.FinishedAt = &finished
 	runs := &fakeRuns{run: run}
@@ -161,6 +176,7 @@ func TestGetRun(t *testing.T) {
 	assert.Equal(t, "750xx", body["bulk_job_id"])
 	assert.InDelta(t, 1500, body["records_ok"], 0)
 	assert.Equal(t, run.Error, body["error"])
+	assert.InDelta(t, 1, body["resumes"], 0)
 	assert.Equal(t, "2026-10-21T09:00:01Z", body["started_at"])
 	assert.Equal(t, "2026-10-21T09:01:01Z", body["finished_at"])
 }

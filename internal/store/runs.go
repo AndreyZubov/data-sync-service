@@ -1,9 +1,11 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 	"unicode/utf8"
 
@@ -56,16 +58,39 @@ type Run struct {
 	Status    RunStatus
 	// FullSync is set when the run ignores the watermark and reads every record.
 	FullSync bool
-	// BulkJobID is the Salesforce Bulk API job, once one has been created.
+	// BulkJobID is the Salesforce Bulk API job, once one has been created;
+	// for an import, the latest of its jobs.
 	BulkJobID     string
 	RecordsOK     int64
 	RecordsFailed int64
 	// Error describes why the run failed or was cancelled.
-	Error      string
+	Error string
+	// Resumes counts the service restarts the run has been resumed after.
+	Resumes int
+	// Checkpoint is an export's progress through its query job's results.
+	Checkpoint ExportCheckpoint
+	// Owner is the service instance holding the run's lease; empty when none
+	// does.
+	Owner      string
 	CreatedAt  time.Time
 	StartedAt  *time.Time
 	FinishedAt *time.Time
 }
+
+// ExportCheckpoint is how far an export has loaded its query job's results:
+// every page before Locator is committed to the store.
+type ExportCheckpoint struct {
+	// Locator names the next result page to load; empty means the first.
+	Locator string
+	// Watermark is the highest SystemModstamp of the committed pages.
+	Watermark *time.Time
+	// Records is the number of records on the committed pages.
+	Records int64
+}
+
+// MaxResumes is how many restarts a run is resumed after. A run interrupted
+// more often may be what brings the service down, so it is failed instead.
+const MaxResumes = 3
 
 // RunInProgressError is returned by CreateRun when the object already has a
 // queued or running run in the same direction.
@@ -79,16 +104,18 @@ func (e *RunInProgressError) Error() string {
 }
 
 const runColumns = `id, object_name, direction, trigger, status, full_sync, coalesce(bulk_job_id, ''),
-	records_ok, records_failed, coalesce(error, ''), created_at, started_at, finished_at`
+	records_ok, records_failed, coalesce(error, ''), resumes, coalesce(checkpoint_locator, ''),
+	checkpoint_watermark, checkpoint_records, coalesce(owner, ''), created_at, started_at, finished_at`
 
-// CreateRun records a new queued run. If the object already has an active run
-// in the same direction it returns a *RunInProgressError.
+// CreateRun records a new queued run, leased by this instance. If the object
+// already has an active run in the same direction it returns a
+// *RunInProgressError.
 func (s *Store) CreateRun(ctx context.Context, object string, dir Direction, trigger Trigger, fullSync bool) (Run, error) {
 	row := s.pool.QueryRow(ctx, `
-		INSERT INTO sync_runs (object_name, direction, trigger, status, full_sync)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO sync_runs (object_name, direction, trigger, status, full_sync, owner, heartbeat_at)
+		VALUES ($1, $2, $3, $4, $5, $6, now())
 		RETURNING `+runColumns,
-		object, dir, trigger, Queued, fullSync)
+		object, dir, trigger, Queued, fullSync, s.instance)
 	run, err := scanRun(row)
 	if err == nil {
 		return run, nil
@@ -122,36 +149,75 @@ func (s *Store) GetRun(ctx context.Context, id int64) (Run, error) {
 	return run, nil
 }
 
+// The methods below that change an active run do so only while this
+// instance holds the run's lease. An instance that lost it, for example after
+// a long database outage, gets an error instead of overwriting the progress
+// of the instance that took the run over.
+
 // StartRun moves a queued run to running.
 func (s *Store) StartRun(ctx context.Context, id int64) error {
 	return s.execOne(ctx, "start run", id, `
 		UPDATE sync_runs SET status = 'running', started_at = now()
-		WHERE id = $1 AND status = 'queued'`, id)
+		WHERE id = $1 AND status = 'queued' AND owner = $2`, id, s.instance)
 }
 
-// SetBulkJob records the Salesforce Bulk API job that serves a run.
-func (s *Store) SetBulkJob(ctx context.Context, id int64, jobID string) error {
-	return s.execOne(ctx, "set bulk job", id, `UPDATE sync_runs SET bulk_job_id = $2 WHERE id = $1`, id, jobID)
+// StartExportJob records the query job an export reads from. Records loaded
+// from an earlier job of the run are read again, so the run's checkpoint and
+// record count start over.
+func (s *Store) StartExportJob(ctx context.Context, id int64, jobID string) error {
+	return s.execOne(ctx, "start export job", id, `
+		UPDATE sync_runs SET bulk_job_id = $2, records_ok = 0,
+			checkpoint_locator = NULL, checkpoint_watermark = NULL, checkpoint_records = 0
+		WHERE id = $1 AND status = 'running' AND owner = $3`, id, jobID, s.instance)
 }
 
-// FinishRun moves an active run to a terminal status. cause is stored as the
-// run's error and may be nil.
+// SaveCheckpoint records an export's progress, so a resumed run continues
+// from there.
+func (s *Store) SaveCheckpoint(ctx context.Context, id int64, cp ExportCheckpoint) error {
+	return s.execOne(ctx, "save checkpoint", id, `
+		UPDATE sync_runs SET checkpoint_locator = nullif($2, ''), checkpoint_watermark = $3, checkpoint_records = $4
+		WHERE id = $1 AND status = 'running' AND owner = $5`, id, cp.Locator, cp.Watermark, cp.Records, s.instance)
+}
+
+// FinishRun moves an active run to a terminal status and returns the outbox
+// entries it had not decided to pending. cause is stored as the run's error
+// and may be nil.
 func (s *Store) FinishRun(ctx context.Context, id int64, status RunStatus, cause error) error {
 	var msg *string
 	if cause != nil {
 		m := truncateError(cause.Error())
 		msg = &m
 	}
-	return s.execOne(ctx, "finish run", id, `
-		UPDATE sync_runs SET status = $2, error = $3, finished_at = now()
-		WHERE id = $1 AND status IN ('queued', 'running')`, id, status, msg)
+	return s.endRun(ctx, "finish run", id, `
+		UPDATE sync_runs SET status = $2, error = $3, finished_at = now(), owner = NULL
+		WHERE id = $1 AND status IN ('queued', 'running') AND owner = $4`, id, status, msg, s.instance)
 }
 
-// CompleteRun marks a running run succeeded.
+// CompleteRun marks a running run succeeded. Any outbox entry it left
+// undecided goes back to pending.
 func (s *Store) CompleteRun(ctx context.Context, id int64) error {
-	return s.execOne(ctx, "complete run", id, `
-		UPDATE sync_runs SET status = 'succeeded', finished_at = now()
-		WHERE id = $1 AND status = 'running'`, id)
+	return s.endRun(ctx, "complete run", id, `
+		UPDATE sync_runs SET status = 'succeeded', finished_at = now(), owner = NULL
+		WHERE id = $1 AND status = 'running' AND owner = $2`, id, s.instance)
+}
+
+// endRun runs a statement that ends the run with the given ID and releases
+// the run's undecided outbox entries, in one transaction, so no entry is left
+// claimed by a run that is over.
+func (s *Store) endRun(ctx context.Context, action string, id int64, sql string, args ...any) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, sql, args...)
+		if err != nil {
+			return fmt.Errorf("%s %d: %w", action, id, err)
+		}
+		if tag.RowsAffected() != 1 {
+			return fmt.Errorf("%s %d: %w", action, id, errRunState)
+		}
+		if _, err := tx.Exec(ctx, releaseOutboxSQL+` AND run_id = $1`, id); err != nil {
+			return fmt.Errorf("%s %d: release outbox entries: %w", action, id, err)
+		}
+		return nil
+	})
 }
 
 // CompleteExport marks an export run succeeded and, when watermark is not nil,
@@ -161,13 +227,13 @@ func (s *Store) CompleteRun(ctx context.Context, id int64) error {
 func (s *Store) CompleteExport(ctx context.Context, run Run, watermark *time.Time) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
-			UPDATE sync_runs SET status = 'succeeded', finished_at = now()
-			WHERE id = $1 AND status = 'running'`, run.ID)
+			UPDATE sync_runs SET status = 'succeeded', finished_at = now(), owner = NULL
+			WHERE id = $1 AND status = 'running' AND owner = $2`, run.ID, s.instance)
 		if err != nil {
 			return fmt.Errorf("complete run %d: %w", run.ID, err)
 		}
 		if tag.RowsAffected() != 1 {
-			return fmt.Errorf("complete run %d: run is not running", run.ID)
+			return fmt.Errorf("complete run %d: %w", run.ID, errRunState)
 		}
 		if watermark == nil {
 			return nil
@@ -187,26 +253,87 @@ func (s *Store) CompleteExport(ctx context.Context, run Run, watermark *time.Tim
 	})
 }
 
-// FailInterruptedRuns marks every queued or running run as failed and returns
-// the outbox entries they were sending to pending. It is meant for startup,
-// when no run can still be in progress, and returns the number of runs it
-// closed. It assumes a single service instance per database.
-func (s *Store) FailInterruptedRuns(ctx context.Context) (int64, error) {
-	var n int64
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+// RecoverRuns settles the active runs whose lease has lapsed: those no
+// instance holds, and those whose owner has not renewed the lease within
+// leaseTTL, presumably because it crashed. Every instance may call it at any
+// time; row locks make sure only one of them takes over a given run.
+//
+// A lapsed running run that already has a Salesforce job is resumable: this
+// instance takes its lease, its resume count goes up, and it is returned,
+// still running, for the caller to continue. A resumed export's record count
+// goes back to its checkpoint, because the pages after it are loaded again.
+// Every other lapsed run is failed, as is a run already resumed maxResumes
+// times, and the outbox entries of failed runs go back to pending. failed is
+// the number of runs failed.
+func (s *Store) RecoverRuns(ctx context.Context, maxResumes int, leaseTTL time.Duration) (failed int64, resumed []Run, err error) {
+	// lapsed matches active runs whose lease has lapsed, given the lease TTL
+	// in microseconds as query parameter n.
+	lapsed := func(n int) string {
+		return fmt.Sprintf(`status IN ('queued', 'running') AND (owner IS NULL OR heartbeat_at IS NULL
+			OR heartbeat_at < now() - $%d * interval '1 microsecond')`, n)
+	}
+	ttl := float64(leaseTTL.Microseconds())
+	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
-			UPDATE sync_runs SET status = 'failed', error = 'interrupted by a service restart', finished_at = now()
-			WHERE status IN ('queued', 'running')`)
+			UPDATE sync_runs SET status = 'failed', finished_at = now(), owner = NULL,
+				error = CASE WHEN resumes >= $1 THEN 'interrupted by a service restart too many times'
+				             ELSE 'interrupted by a service restart' END
+			WHERE `+lapsed(2)+` AND (status = 'queued' OR bulk_job_id IS NULL OR resumes >= $1)`,
+			maxResumes, ttl)
 		if err != nil {
 			return fmt.Errorf("fail interrupted runs: %w", err)
 		}
-		n = tag.RowsAffected()
-		if _, err := tx.Exec(ctx, releaseOutboxSQL); err != nil {
+		failed = tag.RowsAffected()
+		if _, err := tx.Exec(ctx, releaseOutboxSQL+`
+			AND run_id IN (SELECT id FROM sync_runs WHERE status NOT IN ('queued', 'running'))`); err != nil {
 			return fmt.Errorf("release outbox entries of interrupted runs: %w", err)
+		}
+
+		rows, err := tx.Query(ctx, `
+			UPDATE sync_runs SET owner = $2, heartbeat_at = now(), resumes = resumes + 1,
+				records_ok = CASE direction WHEN 'export' THEN checkpoint_records ELSE records_ok END
+			WHERE `+lapsed(1)+`
+			RETURNING `+runColumns, ttl, s.instance)
+		if err != nil {
+			return fmt.Errorf("resume interrupted runs: %w", err)
+		}
+		resumed, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (Run, error) { return scanRun(row) })
+		if err != nil {
+			return fmt.Errorf("resume interrupted runs: %w", err)
 		}
 		return nil
 	})
-	return n, err
+	if err != nil {
+		return 0, nil, err
+	}
+	slices.SortFunc(resumed, func(a, b Run) int { return cmp.Compare(a.ID, b.ID) })
+	return failed, resumed, nil
+}
+
+// Heartbeat renews the lease of every active run this instance holds and
+// returns their IDs. A run missing from the result has been taken over by
+// another instance, or finished, and must not be worked on any further.
+func (s *Store) Heartbeat(ctx context.Context) ([]int64, error) {
+	rows, err := s.pool.Query(ctx, `
+		UPDATE sync_runs SET heartbeat_at = now()
+		WHERE owner = $1 AND status IN ('queued', 'running')
+		RETURNING id`, s.instance)
+	if err != nil {
+		return nil, fmt.Errorf("renew run leases: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, fmt.Errorf("renew run leases: %w", err)
+	}
+	return ids, nil
+}
+
+// ReleaseRun gives up this instance's lease of an active run without ending
+// it, so that any instance may resume it straight away.
+func (s *Store) ReleaseRun(ctx context.Context, id int64) error {
+	return s.execOne(ctx, "release run", id, `
+		UPDATE sync_runs SET owner = NULL
+		WHERE id = $1 AND status IN ('queued', 'running') AND owner = $2`, id, s.instance)
 }
 
 // Watermark returns the object's watermark, or nil if it has none yet.
@@ -242,14 +369,18 @@ func (s *Store) execOne(ctx context.Context, action string, id int64, sql string
 		return fmt.Errorf("%s %d: %w", action, id, err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("%s %d: run not found or not in the expected state", action, id)
+		return fmt.Errorf("%s %d: %w", action, id, errRunState)
 	}
 	return nil
 }
 
+// errRunState reports a run change that matched no run.
+var errRunState = errors.New("run not found, not in the expected state, or leased by another instance")
+
 func scanRun(row pgx.Row) (Run, error) {
 	var r Run
 	err := row.Scan(&r.ID, &r.Object, &r.Direction, &r.Trigger, &r.Status, &r.FullSync, &r.BulkJobID,
-		&r.RecordsOK, &r.RecordsFailed, &r.Error, &r.CreatedAt, &r.StartedAt, &r.FinishedAt)
+		&r.RecordsOK, &r.RecordsFailed, &r.Error, &r.Resumes, &r.Checkpoint.Locator, &r.Checkpoint.Watermark,
+		&r.Checkpoint.Records, &r.Owner, &r.CreatedAt, &r.StartedAt, &r.FinishedAt)
 	return r, err
 }

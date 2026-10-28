@@ -117,6 +117,7 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	assert.Equal(t, "info", cfg.LogLevel)
 	assert.Equal(t, 4, cfg.MaxConcurrentJobs)
 	assert.Equal(t, 10, cfg.APIRateLimit)
+	assert.Equal(t, 80, cfg.APIUsageThreshold)
 	assert.Equal(t, 4, cfg.WorkerCount)
 	assert.Equal(t, 10000, cfg.ImportMaxRecords)
 	assert.Equal(t, 5, cfg.ImportMaxAttempts)
@@ -134,6 +135,7 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	t.Setenv("WORKER_COUNT", "16")
 	t.Setenv("IMPORT_MAX_RECORDS", "500")
 	t.Setenv("IMPORT_MAX_ATTEMPTS", "3")
+	t.Setenv("API_USAGE_THRESHOLD", "0")
 	t.Setenv("DATABASE_URL", "postgres://user:pass@db:5432/sync")
 	t.Setenv("SYNC_OBJECTS", "")
 
@@ -145,6 +147,7 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	assert.Equal(t, 16, cfg.WorkerCount)
 	assert.Equal(t, 500, cfg.ImportMaxRecords)
 	assert.Equal(t, 3, cfg.ImportMaxAttempts)
+	assert.Equal(t, 0, cfg.APIUsageThreshold, "zero turns the check off")
 	assert.Equal(t, "postgres://user:pass@db:5432/sync", cfg.DatabaseURL)
 	assert.Equal(t, "client-id", cfg.SFClientID)
 	assert.Equal(t, "client-secret", cfg.SFClientSecret)
@@ -185,6 +188,8 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		{name: "zero import batch", env: map[string]string{"IMPORT_MAX_RECORDS": "0"}, wantMsg: "IMPORT_MAX_RECORDS"},
 		{name: "zero import attempts", env: map[string]string{"IMPORT_MAX_ATTEMPTS": "0"}, wantMsg: "IMPORT_MAX_ATTEMPTS"},
 		{name: "zero rate limit", env: map[string]string{"API_RATE_LIMIT": "0"}, wantMsg: "API_RATE_LIMIT"},
+		{name: "usage threshold above 100", env: map[string]string{"API_USAGE_THRESHOLD": "101"}, wantMsg: "API_USAGE_THRESHOLD"},
+		{name: "negative usage threshold", env: map[string]string{"API_USAGE_THRESHOLD": "-1"}, wantMsg: "API_USAGE_THRESHOLD"},
 		{name: "zero shutdown timeout", env: map[string]string{"SHUTDOWN_TIMEOUT": "0s"}, wantMsg: "SHUTDOWN_TIMEOUT"},
 		{name: "plain http login URL", env: map[string]string{"SF_LOGIN_URL": "http://login.salesforce.com"}, wantMsg: "SF_LOGIN_URL"},
 		{name: "unparsable login URL", env: map[string]string{"SF_LOGIN_URL": "https://[::1"}, wantMsg: "SF_LOGIN_URL"},

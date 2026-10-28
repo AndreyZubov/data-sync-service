@@ -33,6 +33,7 @@ type Config struct {
 	SyncObjectsRaw    string `env:"SYNC_OBJECTS"`
 	MaxConcurrentJobs int    `env:"MAX_CONCURRENT_JOBS" envDefault:"4"`
 	APIRateLimit      int    `env:"API_RATE_LIMIT" envDefault:"10"`
+	APIUsageThreshold int    `env:"API_USAGE_THRESHOLD" envDefault:"80"`
 	WorkerCount       int    `env:"WORKER_COUNT" envDefault:"4"`
 	ImportMaxRecords  int    `env:"IMPORT_MAX_RECORDS" envDefault:"10000"`
 	ImportMaxAttempts int    `env:"IMPORT_MAX_ATTEMPTS" envDefault:"5"`
@@ -118,6 +119,10 @@ func (c *Config) validate() error {
 		if p.value < 1 {
 			errs = append(errs, fmt.Errorf("%s must be at least 1, got %d", p.name, p.value))
 		}
+	}
+
+	if c.APIUsageThreshold < 0 || c.APIUsageThreshold > 100 {
+		errs = append(errs, fmt.Errorf("API_USAGE_THRESHOLD must be a percentage from 0 to 100, got %d", c.APIUsageThreshold))
 	}
 
 	if c.ShutdownTimeout <= 0 {

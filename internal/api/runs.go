@@ -19,6 +19,7 @@ type runResponse struct {
 	RecordsOK     int64      `json:"records_ok"`
 	RecordsFailed int64      `json:"records_failed"`
 	Error         string     `json:"error,omitempty"`
+	Resumes       int        `json:"resumes,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
 	StartedAt     *time.Time `json:"started_at,omitempty"`
 	FinishedAt    *time.Time `json:"finished_at,omitempty"`
@@ -36,6 +37,7 @@ func newRunResponse(r store.Run) runResponse {
 		RecordsOK:     r.RecordsOK,
 		RecordsFailed: r.RecordsFailed,
 		Error:         r.Error,
+		Resumes:       r.Resumes,
 		CreatedAt:     r.CreatedAt,
 		StartedAt:     r.StartedAt,
 		FinishedAt:    r.FinishedAt,

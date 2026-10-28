@@ -74,13 +74,17 @@ compose-up: ## Start the local Postgres container
 compose-app: ## Build and start the service and Postgres in containers
 	docker compose --profile app up -d --build
 
+.PHONY: compose-observability
+compose-observability: ## Start the service, Postgres, Prometheus (:9090), and Grafana (:3000)
+	docker compose --profile app --profile observability up -d --build
+
 .PHONY: compose-down
 compose-down: ## Stop all local containers (keeps the volume)
-	docker compose --profile app down
+	docker compose --profile app --profile observability down
 
 .PHONY: compose-clean
 compose-clean: ## Stop all local containers and delete the Postgres volume
-	docker compose --profile app down -v
+	docker compose --profile app --profile observability down -v
 
 .PHONY: install-hooks
 install-hooks: ## Install the repository's git pre-commit hook
