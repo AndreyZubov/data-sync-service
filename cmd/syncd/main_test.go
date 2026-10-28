@@ -184,6 +184,40 @@ func TestExportEndToEnd(t *testing.T) {
 	assert.Contains(t, metrics, `sync_records_total{direction="export",object="Account"} 3`)
 }
 
+func TestRestartResumesARunEndToEnd(t *testing.T) {
+	org := sftest.NewServer(t)
+	org.SetDescribe(sftest.Describe{Name: "Account", Queryable: true, Fields: []sftest.DescribeField{
+		{Name: "Id", Type: "id"}, {Name: "Name", Type: "string"},
+	}})
+	org.OnQuery(func(string, string) ([][]string, error) {
+		return [][]string{{"Id", "Name"}, {"001A", "Acme"}, {"001B", "Globex"}}, nil
+	})
+	org.SetAPIUsage(120, 15000)
+	org.HoldJobs(true)
+	cfg := testConfig(t, org, sftest.ClientSecret)
+	baseURL, stop, done := startServe(t, cfg, org.HTTPClient())
+
+	resp, err := http.Post(baseURL+"/sync/account/export", "", nil)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	location := resp.Header.Get("Location")
+	require.Eventually(t, func() bool { return len(org.QueryJobs()) == 1 }, 5*time.Second, 10*time.Millisecond)
+	stop()
+	require.NoError(t, waitFor(t, done))
+	org.HoldJobs(false)
+
+	baseURL, _, _ = startServe(t, cfg, org.HTTPClient())
+
+	run := waitForRun(t, baseURL+location)
+	assert.Equal(t, "succeeded", run.Status, run.Error)
+	assert.Equal(t, 2, run.RecordsOK)
+	assert.Len(t, org.QueryJobs(), 1, "the restarted service continues the same query job")
+	_, metrics := get(t, baseURL+"/metrics")
+	assert.Contains(t, metrics, `sync_runs_resumed_total{direction="export",object="Account"} 1`)
+	assert.Contains(t, metrics, `salesforce_api_usage_limit 15000`)
+}
+
 // finishedRun is the part of a run response the end-to-end tests check.
 type finishedRun struct {
 	Status        string `json:"status"`

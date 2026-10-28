@@ -78,6 +78,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 // given the result of starting it.
 func (s *Server) writeStarted(w http.ResponseWriter, object string, run store.Run, err error, dir store.Direction) {
 	var inProgress *store.RunInProgressError
+	var usage *syncer.APIUsageError
 	switch {
 	case err == nil:
 		w.Header().Set("Location", "/runs/"+strconv.FormatInt(run.ID, 10))
@@ -87,6 +88,9 @@ func (s *Server) writeStarted(w http.ResponseWriter, object string, run store.Ru
 			"error":  "an " + string(dir) + " of this object is already in progress",
 			"run_id": inProgress.RunID,
 		})
+	case errors.As(err, &usage):
+		w.Header().Set("Retry-After", strconv.Itoa(int(usage.RetryAfter.Seconds())))
+		writeError(w, http.StatusServiceUnavailable, err.Error())
 	case errors.Is(err, syncer.ErrShuttingDown):
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 	default:

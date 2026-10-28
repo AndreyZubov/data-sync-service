@@ -122,6 +122,8 @@ func newApp(ctx context.Context, cfg *config.Config, log *zap.Logger, sfHTTP *ht
 		APIVersion: cfg.SFAPIVersion,
 		HTTPClient: sfHTTP,
 		Logger:     log,
+		RateLimit:  float64(cfg.APIRateLimit),
+		Registerer: reg,
 	})
 
 	orch := syncer.New(syncer.Config{
@@ -131,6 +133,7 @@ func newApp(ctx context.Context, cfg *config.Config, log *zap.Logger, sfHTTP *ht
 		MaxConcurrentRuns: cfg.MaxConcurrentJobs,
 		ImportMaxRecords:  cfg.ImportMaxRecords,
 		ImportMaxAttempts: cfg.ImportMaxAttempts,
+		APIUsageThreshold: float64(cfg.APIUsageThreshold) / 100,
 		Logger:            log,
 		Registerer:        reg,
 	})

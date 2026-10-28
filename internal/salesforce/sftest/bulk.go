@@ -76,6 +76,15 @@ func (s *Server) HoldJobs(hold bool) {
 	s.holdJobs = hold
 }
 
+// BeforeResultPage sets a function called before every result page of a
+// query job is served, with the page's locator ("" for the first page). It
+// can block, for example until r's context ends, to stop a download midway.
+func (s *Server) BeforeResultPage(fn func(r *http.Request, jobID, locator string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.beforePage = fn
+}
+
 // QueryJobs returns every query job the org has received, oldest first.
 func (s *Server) QueryJobs() []QueryJob {
 	s.mu.Lock()
@@ -190,8 +199,15 @@ func (s *Server) handleQueryResults(w http.ResponseWriter, r *http.Request) {
 	if ok {
 		state, rows = job.State, job.rows
 	}
-	pageSize := s.pageSize
+	pageSize, beforePage := s.pageSize, s.beforePage
 	s.mu.Unlock()
+
+	if beforePage != nil {
+		beforePage(r, r.PathValue("id"), r.URL.Query().Get("locator"))
+		if r.Context().Err() != nil {
+			return
+		}
+	}
 
 	switch {
 	case !ok:

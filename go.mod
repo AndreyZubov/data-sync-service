@@ -2,6 +2,8 @@ module github.com/AndreyZubov/data-sync-service
 
 go 1.26.3
 
+toolchain go1.26.10
+
 require (
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/go-chi/chi/v5 v5.3.2
@@ -13,6 +15,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
 	go.uber.org/zap v1.28.0
 	golang.org/x/sync v0.24.0
+	golang.org/x/time v0.16.0
 )
 
 require (

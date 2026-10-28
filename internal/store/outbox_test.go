@@ -39,6 +39,7 @@ type entryState struct {
 	attempts    int
 	lastError   *string
 	sfID        *string
+	bulkJobID   *string
 	nextAttempt time.Time
 }
 
@@ -46,8 +47,8 @@ func readEntry(t *testing.T, db *storetest.DB, id int64) entryState {
 	t.Helper()
 	var e entryState
 	require.NoError(t, db.Pool.QueryRow(context.Background(), `
-		SELECT status, attempts, last_error, salesforce_id, next_attempt_at FROM sf_outbox WHERE id = $1`, id).
-		Scan(&e.status, &e.attempts, &e.lastError, &e.sfID, &e.nextAttempt))
+		SELECT status, attempts, last_error, salesforce_id, bulk_job_id, next_attempt_at FROM sf_outbox WHERE id = $1`, id).
+		Scan(&e.status, &e.attempts, &e.lastError, &e.sfID, &e.bulkJobID, &e.nextAttempt))
 	return e
 }
 
@@ -217,35 +218,146 @@ func TestRecordOutcomesBacksOffExponentially(t *testing.T) {
 		"the fourth attempt would wait 8 minutes, capped at 5")
 }
 
-func TestReleaseOutbox(t *testing.T) {
-	db := storetest.New(t)
-	ctx := context.Background()
-	id := addEntry(t, db, "Account", store.Insert, "", `{"Name":"A"}`)
-	run := importRun(t, db, "Account")
-	_, err := db.Store.ClaimOutbox(ctx, run.ID, "Account", 10)
-	require.NoError(t, err)
+func TestEndingARunReleasesItsUndecidedEntries(t *testing.T) {
+	for name, end := range map[string]func(*store.Store, int64) error{
+		"finished": func(s *store.Store, id int64) error {
+			return s.FinishRun(context.Background(), id, store.Cancelled, nil)
+		},
+		"completed": func(s *store.Store, id int64) error { return s.CompleteRun(context.Background(), id) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			db := storetest.New(t)
+			ctx := context.Background()
+			decided := addEntry(t, db, "Account", store.Insert, "", `{"Name":"A"}`)
+			undecided := addEntry(t, db, "Account", store.Insert, "", `{"Name":"B"}`)
+			run := importRun(t, db, "Account")
+			_, err := db.Store.ClaimOutbox(ctx, run.ID, "Account", 10)
+			require.NoError(t, err)
+			require.NoError(t, db.Store.AssignIngestJob(ctx, run.ID, "750a", []int64{decided, undecided}))
+			_, err = db.Store.RecordOutcomes(ctx, run.ID, []store.Outcome{{EntryID: decided, Kind: store.Delivered}},
+				store.RetryPolicy{MaxAttempts: 5})
+			require.NoError(t, err)
 
-	n, err := db.Store.ReleaseOutbox(ctx, run.ID)
+			require.NoError(t, end(db.Store, run.ID))
 
-	require.NoError(t, err)
-	assert.EqualValues(t, 1, n)
-	e := readEntry(t, db, id)
-	assert.Equal(t, store.Pending, e.status)
-	assert.Equal(t, 0, e.attempts, "an interrupted attempt does not count")
+			assert.Equal(t, store.Sent, readEntry(t, db, decided).status)
+			e := readEntry(t, db, undecided)
+			assert.Equal(t, store.Pending, e.status)
+			assert.Equal(t, 0, e.attempts, "an attempt without an outcome does not count")
+			require.NotNil(t, e.bulkJobID)
+			assert.Equal(t, "750a", *e.bulkJobID, "the next run collects the outcome from the job")
+		})
+	}
 }
 
-func TestFailInterruptedRunsReleasesTheirEntries(t *testing.T) {
+func TestAssignIngestJobAndRunOutbox(t *testing.T) {
 	db := storetest.New(t)
 	ctx := context.Background()
-	id := addEntry(t, db, "Account", store.Insert, "", `{"Name":"A"}`)
+	a := addEntry(t, db, "Account", store.Insert, "", `{"Name":"A"}`)
+	b := addEntry(t, db, "Account", store.Insert, "", `{"Name":"B"}`)
+	c := addEntry(t, db, "Account", store.Insert, "", `{"Name":"C"}`)
 	run := importRun(t, db, "Account")
 	_, err := db.Store.ClaimOutbox(ctx, run.ID, "Account", 10)
 	require.NoError(t, err)
 
-	_, err = db.Store.FailInterruptedRuns(ctx)
+	require.NoError(t, db.Store.AssignIngestJob(ctx, run.ID, "750a", []int64{a, c}))
+	_, err = db.Store.RecordOutcomes(ctx, run.ID, []store.Outcome{{EntryID: c, Kind: store.Delivered}},
+		store.RetryPolicy{MaxAttempts: 5})
+	require.NoError(t, err)
+
+	entries, err := db.Store.RunOutbox(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []int64{a, b}, entryIDs(entries), "only undecided entries")
+	assert.Equal(t, "750a", entries[0].BulkJobID)
+	assert.Empty(t, entries[1].BulkJobID)
+	got, err := db.Store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "750a", got.BulkJobID)
+
+	err = db.Store.AssignIngestJob(ctx, run.ID, "750b", []int64{b, c})
+	assert.ErrorContains(t, err, "1 of 2 entries are not processing")
+	entries, err = db.Store.RunOutbox(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Empty(t, entries[1].BulkJobID, "a failed assignment changes nothing")
+}
+
+func TestClaimOutboxReturnsTheJobOfAnUndecidedEntry(t *testing.T) {
+	db := storetest.New(t)
+	ctx := context.Background()
+	id := addEntry(t, db, "Account", store.Insert, "", `{"Name":"A"}`)
+	first := importRun(t, db, "Account")
+	_, err := db.Store.ClaimOutbox(ctx, first.ID, "Account", 10)
+	require.NoError(t, err)
+	require.NoError(t, db.Store.AssignIngestJob(ctx, first.ID, "750a", []int64{id}))
+	require.NoError(t, db.Store.FinishRun(ctx, first.ID, store.Failed, nil))
+
+	second := importRun(t, db, "Account")
+	entries, err := db.Store.ClaimOutbox(ctx, second.ID, "Account", 10)
 
 	require.NoError(t, err)
-	assert.Equal(t, store.Pending, readEntry(t, db, id).status)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "750a", entries[0].BulkJobID)
+	assert.Equal(t, 1, entries[0].Attempts)
+}
+
+func TestRetriedDeadLettersAreUploadedAgain(t *testing.T) {
+	db := storetest.New(t)
+	ctx := context.Background()
+	id := addEntry(t, db, "Account", store.Insert, "", `{"Name":"A"}`)
+	_, err := db.Pool.Exec(ctx, `UPDATE sf_outbox SET status = 'dead', bulk_job_id = '750a' WHERE id = $1`, id)
+	require.NoError(t, err)
+
+	_, err = db.Store.RetryDeadLetters(ctx, "Account")
+
+	require.NoError(t, err)
+	assert.Nil(t, readEntry(t, db, id).bulkJobID)
+}
+
+func TestRetriedEntriesAreUploadedAgain(t *testing.T) {
+	db := storetest.New(t)
+	ctx := context.Background()
+	id := addEntry(t, db, "Account", store.Insert, "", `{"Name":"A"}`)
+	first := importRun(t, db, "Account")
+	_, err := db.Store.ClaimOutbox(ctx, first.ID, "Account", 10)
+	require.NoError(t, err)
+	require.NoError(t, db.Store.AssignIngestJob(ctx, first.ID, "750a", []int64{id}))
+	_, err = db.Store.RecordOutcomes(ctx, first.ID, []store.Outcome{{EntryID: id, Kind: store.Retry, Error: "x"}},
+		store.RetryPolicy{MaxAttempts: 5})
+	require.NoError(t, err)
+	require.NoError(t, db.Store.CompleteRun(ctx, first.ID))
+	_, err = db.Pool.Exec(ctx, `UPDATE sf_outbox SET next_attempt_at = now() WHERE id = $1`, id)
+	require.NoError(t, err)
+
+	second := importRun(t, db, "Account")
+	entries, err := db.Store.ClaimOutbox(ctx, second.ID, "Account", 10)
+
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Empty(t, entries[0].BulkJobID)
+	assert.Nil(t, readEntry(t, db, id).bulkJobID)
+}
+
+func TestRecoverRunsReleasesEntriesOfFailedRunsOnly(t *testing.T) {
+	db := storetest.New(t)
+	ctx := context.Background()
+	sent := addEntry(t, db, "Account", store.Insert, "", `{"Name":"A"}`)
+	unsent := addEntry(t, db, "Contact", store.Insert, "", `{"LastName":"B"}`)
+	resumable := importRun(t, db, "Account")
+	_, err := db.Store.ClaimOutbox(ctx, resumable.ID, "Account", 10)
+	require.NoError(t, err)
+	require.NoError(t, db.Store.AssignIngestJob(ctx, resumable.ID, "750a", []int64{sent}))
+	failing := importRun(t, db, "Contact")
+	_, err = db.Store.ClaimOutbox(ctx, failing.ID, "Contact", 10)
+	require.NoError(t, err)
+
+	abandon(t, db, resumable.ID, failing.ID)
+	_, resumed, err := db.Store.RecoverRuns(ctx, store.MaxResumes, time.Minute)
+
+	require.NoError(t, err)
+	require.Len(t, resumed, 1)
+	assert.Equal(t, resumable.ID, resumed[0].ID)
+	assert.Equal(t, store.Processing, readEntry(t, db, sent).status, "the resumed run collects its result")
+	assert.Equal(t, store.Pending, readEntry(t, db, unsent).status)
 }
 
 func TestDeadLettersAndRetry(t *testing.T) {

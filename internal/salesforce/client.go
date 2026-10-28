@@ -10,10 +10,13 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 
 	"github.com/AndreyZubov/data-sync-service/internal/retry"
 )
@@ -78,6 +81,11 @@ type ClientConfig struct {
 	// default to one and thirty seconds.
 	JobPollInterval    time.Duration
 	JobPollMaxInterval time.Duration
+	// RateLimit caps the requests sent per second, retries included, with
+	// bursts of up to one second's worth; zero means no limit.
+	RateLimit float64
+	// Registerer receives the client's metrics; nil leaves them unregistered.
+	Registerer prometheus.Registerer
 }
 
 // Client sends authenticated requests to the Salesforce data API. It is safe
@@ -88,6 +96,9 @@ type Client struct {
 	http       *http.Client
 	retry      retry.Policy
 	log        *zap.Logger
+	limiter    *rate.Limiter // nil when unlimited
+	usage      *usageTracker
+	metrics    *clientMetrics
 
 	pollInterval    time.Duration
 	pollMaxInterval time.Duration
@@ -101,9 +112,14 @@ func NewClient(cfg ClientConfig) *Client {
 		http:       cfg.HTTPClient,
 		retry:      cfg.Retry,
 		log:        cfg.Logger,
+		metrics:    newClientMetrics(cfg.Registerer),
 
 		pollInterval:    cfg.JobPollInterval,
 		pollMaxInterval: cfg.JobPollMaxInterval,
+	}
+	c.usage = &usageTracker{onObserve: c.metrics.usage}
+	if cfg.RateLimit > 0 {
+		c.limiter = rate.NewLimiter(rate.Limit(cfg.RateLimit), max(1, int(cfg.RateLimit)))
 	}
 	if c.http == nil {
 		c.http = NewHTTPClient()
@@ -144,7 +160,7 @@ func (c *Client) Do(ctx context.Context, req Request) (*http.Response, error) {
 			if ctx.Err() != nil || !idempotent(req.Method) || attempt >= c.retry.MaxAttempts {
 				return nil, fmt.Errorf("%s %s: %w", req.Method, req.Path, err)
 			}
-			if err := c.wait(ctx, req, attempt, c.retry.Backoff(attempt), zap.Error(err)); err != nil {
+			if err := c.wait(ctx, req, attempt, c.retry.Backoff(attempt), "error", zap.Error(err)); err != nil {
 				return nil, err
 			}
 			continue
@@ -168,7 +184,7 @@ func (c *Client) Do(ctx context.Context, req Request) (*http.Response, error) {
 		if !ok {
 			return nil, apiErr
 		}
-		if err := c.wait(ctx, req, attempt, delay, zap.Int("status", resp.StatusCode)); err != nil {
+		if err := c.wait(ctx, req, attempt, delay, strconv.Itoa(resp.StatusCode), zap.Int("status", resp.StatusCode)); err != nil {
 			return nil, err
 		}
 	}
@@ -204,7 +220,14 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, in, out any) e
 	return nil
 }
 
+// send makes one attempt at req, once the rate limit allows it, and records
+// the org's API usage reported by the response.
 func (c *Client) send(ctx context.Context, token Token, req Request) (*http.Response, error) {
+	if c.limiter != nil {
+		if err := c.limiter.Wait(ctx); err != nil {
+			return nil, fmt.Errorf("wait for rate limit: %w", err)
+		}
+	}
 	base, err := url.Parse(token.InstanceURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse instance URL: %w", err)
@@ -227,7 +250,17 @@ func (c *Client) send(ctx context.Context, token Token, req Request) (*http.Resp
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+string(token.AccessToken))
 	httpReq.Header.Set("User-Agent", userAgent)
-	return c.http.Do(httpReq)
+
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		c.metrics.requests.WithLabelValues("error").Inc()
+		return nil, err
+	}
+	c.metrics.response(resp.StatusCode)
+	if used, limit, ok := parseLimitInfo(resp.Header.Get("Sforce-Limit-Info")); ok {
+		c.usage.observe(APIUsage{Used: used, Max: limit, ObservedAt: time.Now()})
+	}
+	return resp, nil
 }
 
 // retryDelay decides whether a failed response is worth resending and after
@@ -252,7 +285,9 @@ func (c *Client) retryDelay(method string, resp *http.Response, attempt int) (ti
 	}
 }
 
-func (c *Client) wait(ctx context.Context, req Request, attempt int, delay time.Duration, cause zap.Field) error {
+// wait logs a retry and sleeps for delay. reason labels the retry metric.
+func (c *Client) wait(ctx context.Context, req Request, attempt int, delay time.Duration, reason string, cause zap.Field) error {
+	c.metrics.retries.WithLabelValues(reason).Inc()
 	c.log.Warn("retrying salesforce request",
 		zap.String("method", req.Method),
 		zap.String("path", req.Path),

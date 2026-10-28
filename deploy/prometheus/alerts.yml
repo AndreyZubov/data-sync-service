@@ -1,0 +1,46 @@
+groups:
+  - name: data-sync-service
+    rules:
+      - alert: SyncServiceDown
+        expr: up{job="syncd"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: The sync service has not answered metrics scrapes for 5 minutes.
+
+      - alert: SyncRunsFailing
+        expr: sum by (object, direction) (increase(sync_runs_total{status="failed"}[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.direction }} runs of {{ $labels.object }} failed in the last hour."
+          description: GET /runs/{id} shows the error of each run; the service log has the details.
+
+      - alert: SyncDeadLetters
+        expr: sum by (object) (increase(sync_dead_letters_total[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox entries of {{ $labels.object }} were dead-lettered in the last hour."
+          description: GET /sync/{object}/dead-letters lists them; fix the cause and POST /sync/{object}/dead-letters/retry.
+
+      # The service stops starting runs at API_USAGE_THRESHOLD (80% by
+      # default); this fires first, while there is still time to react.
+      - alert: SalesforceAPIUsageHigh
+        expr: salesforce_api_usage_requests / salesforce_api_usage_limit > 0.7
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The org has used {{ $value | humanizePercentage }} of its daily API requests."
+          description: The allocation is shared by every integration of the org; runs pause above API_USAGE_THRESHOLD.
+
+      - alert: SalesforceRetriesHigh
+        expr: sum(rate(salesforce_request_retries_total[15m])) / sum(rate(salesforce_requests_total[15m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than 10% of Salesforce requests are being retried.
+          description: salesforce_request_retries_total shows the status codes behind them; 429 and 503 mean the org is throttling.

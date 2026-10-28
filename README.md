@@ -9,14 +9,16 @@
 > jobs, manages async job lifecycles, respects org API limits, and recovers cleanly
 > from failures.
 
-**Status:** active development. Both directions work end to end. The service
-authenticates with OAuth client credentials. It exports configured objects into
-PostgreSQL through Bulk API 2.0 query jobs, streaming results with flat memory use
-and syncing incrementally from `SystemModstamp` watermarks. It imports changes that
-other systems write to an outbox table through Bulk API 2.0 ingest jobs, retrying
-failed records and dead-lettering those that keep failing. Runs start on a cron
-schedule or on demand, and every run is recorded and inspectable. Org API-limit
-awareness and resumable runs are next on the [roadmap](#roadmap).
+**Status:** feature-complete for the planned scope; not yet tried against a wide
+range of production orgs. The service authenticates with OAuth client
+credentials. It exports configured objects into PostgreSQL through Bulk API 2.0
+query jobs, streaming results with flat memory use and syncing incrementally from
+`SystemModstamp` watermarks. It imports changes that other systems write to an
+outbox table through Bulk API 2.0 ingest jobs, retrying failed records and
+dead-lettering those that keep failing. Runs start on a cron schedule or on
+demand, and every run is recorded and inspectable. Requests are rate-limited,
+runs pause when the org's daily API usage runs high, and a run interrupted by a
+restart or crash resumes from its Salesforce job instead of starting over.
 
 ---
 
@@ -61,8 +63,10 @@ on-demand                                          cron tick
 ```
 
 Cross-cutting: environment-based configuration, structured zap logging, a
-Prometheus registry, an API rate limiter aware of org limits, and graceful
-shutdown across all goroutines.
+Prometheus registry, a rate-limited Salesforce client that tracks the org's API
+usage, and graceful shutdown that suspends runs for resumption.
+[docs/architecture.md](docs/architecture.md) describes the design in detail,
+with sequence and state diagrams.
 
 ---
 
@@ -70,7 +74,9 @@ shutdown across all goroutines.
 
 ### Prerequisites
 
-- Go 1.26.3 or newer (the version in `go.mod`).
+- Go 1.26.3 or newer. `go.mod` asks for the 1.26.10 toolchain, which carries the
+  standard library's security fixes; an older `go` command downloads it on first
+  use.
 - Docker — used for the local Postgres container, the integration tests, and
   `golangci-lint`.
 - A Salesforce org (a free Developer Edition works) with a connected app set up for
@@ -165,13 +171,16 @@ handler timeout, after which the client receives `504 Gateway Timeout`.
 and a `Location: /runs/{id}` header; the export itself runs in the background.
 Add `?full=true` to ignore the watermark and re-read every record. If the object
 is already being exported, the answer is `409 Conflict` with the active `run_id`.
+While the org's API usage is above `API_USAGE_THRESHOLD`, the answer is `503
+Service Unavailable` with a `Retry-After` header (see [Resilience](#resilience)).
 `POST /sync/{object}/import` behaves the same way for imports, without `full`.
 
 `GET /runs/{id}` returns the run's `direction`, `status` (`queued`, `running`,
 `succeeded`, `failed`, or `cancelled`), `trigger` (`manual` or `schedule`),
 `records_ok` and `records_failed`, the Salesforce `bulk_job_id` (for an import, its
 latest ingest job), timestamps, and for unsuccessful runs an `error`. The counts
-grow while the run is in progress.
+grow while the run is in progress. A run resumed after a restart also reports how
+many times in `resumes`.
 
 `GET /sync/{object}/dead-letters` lists the object's dead-lettered entries, oldest
 first, with their payload, attempts, and `last_error`; `?limit=` takes 1 to 1,000
@@ -201,6 +210,11 @@ successful health and metrics probes at `debug`, everything else at `info`.
 | `sync_dead_letters_total` | `object` | Outbox entries dead-lettered |
 | `sync_run_duration_seconds` | `object`, `direction` | Run duration, excluding time queued |
 | `sync_active_runs` | — | Runs currently executing |
+| `sync_runs_resumed_total` | `object`, `direction` | Runs resumed after a restart |
+| `salesforce_requests_total` | `code` | Salesforce data API responses by HTTP status; `error` when none arrived |
+| `salesforce_request_retries_total` | `reason` | Salesforce requests resent, by the status code or `error` that caused it |
+| `salesforce_api_usage_requests` | — | API requests the org has used in the rolling 24 hours, as last reported |
+| `salesforce_api_usage_limit` | — | The org's rolling 24-hour API request allocation |
 
 The `route` label is the route pattern (for example `/runs/{id}`), and requests that
 match no route share the `unmatched` label, so client-supplied paths never create new
@@ -240,11 +254,10 @@ An object has at most one active export, and at most `MAX_CONCURRENT_JOBS` runs
 execute at once; further runs wait in the `queued` state. A scheduled tick that
 finds the previous run still active is skipped.
 
-On shutdown the service stops the schedule, cancels active runs, aborts their
-Salesforce jobs, and records them as `cancelled`. Runs left active by a crash are
-marked `failed` at the next startup. A failed or cancelled export is safe to repeat:
-its records were upserted idempotently and the watermark did not move. Runs are not
-resumed yet (milestone 6). The service assumes a single instance per database.
+Each page of results is committed as a checkpoint once all of its records are
+stored, so an export interrupted by a restart continues where it stopped; see
+[Resuming runs](#resuming-runs). A failed export is safe to repeat: its records
+were upserted idempotently and the watermark did not move.
 
 ### Data model
 
@@ -253,7 +266,7 @@ Migrations are embedded in the binary and applied at startup.
 | Table | Contents |
 |-------|----------|
 | `sf_records` | One row per exported record: `object_name`, `id`, `system_modstamp`, `is_deleted`, `synced_at`, and `data`, a JSONB object keyed by field API name |
-| `sync_runs` | Every run with its status, trigger, Bulk API job ID, counts, error, and timestamps |
+| `sync_runs` | Every run with its status, trigger, Bulk API job ID, counts, error, timestamps, the instance leasing it, and for exports the checkpoint a resumed run continues from |
 | `sync_state` | The watermark of each object and the run that set it |
 | `sf_outbox` | Changes waiting to be imported into Salesforce, with their delivery status; see [How imports work](#how-imports-work) |
 
@@ -314,12 +327,94 @@ that fails as a whole retries its entries the same way and fails the run. An ent
 Salesforce reports no result for is dead-lettered rather than retried, because it
 may have been applied, and sending an insert twice would duplicate the record.
 
-When a run is cancelled, its ingest job is aborted, the outcomes of records already
-processed are stored, and the remaining entries return to `pending` without using
-an attempt; entries of runs interrupted by a crash are returned at the next
-startup. Updates, upserts, and deletes are safe to repeat; an insert caught by such
-an interruption after Salesforce applied it can be sent twice. Where that matters,
-use `upsert` on an external ID.
+Entries are tied to their ingest job before the upload, and keep it until their
+outcome is known. A run interrupted by a restart or crash collects the outcomes of
+the jobs it had sent rather than sending the entries again (see
+[Resuming runs](#resuming-runs)). Entries of a run that fails before learning
+their outcome, for example because the org stays unreachable for longer than the
+retries last, return to `pending` without using an attempt, and the next run
+collects their outcome from the same job. A job Salesforce never processed — one
+left open, or aborted before it started — is simply sent again. So an insert is
+not sent twice, as long as Salesforce keeps the job's results, which it deletes
+some days after the job finishes.
+
+---
+
+## Resilience
+
+**Rate limiting.** Every Salesforce request, retries and job polling included,
+waits for a token bucket that allows `API_RATE_LIMIT` requests per second, with
+bursts of up to one second's worth.
+
+**Retries.** `429` and `503` are retried for every method; other `5xx` responses
+and network errors only for idempotent ones. Delays use exponential backoff with
+full jitter and honour `Retry-After`. `REQUEST_LIMIT_EXCEEDED` is never retried.
+
+**Org API usage.** Salesforce reports the org's rolling 24-hour API usage on every
+response, and the service exports it as metrics. The allocation is shared with
+every other integration of the org, so once usage passes `API_USAGE_THRESHOLD`
+percent, no new run starts: manual requests get `503` with `Retry-After`, and
+scheduled ticks are skipped. Runs already in progress finish. A usage report
+older than five minutes is refreshed from Salesforce before a run is refused, as
+usage falls when old requests leave the 24-hour window.
+
+### Resuming runs
+
+On `SIGINT` or `SIGTERM` the service stops the schedule, refuses new runs, and
+stops the active ones within `SHUTDOWN_TIMEOUT`. A run that has not created a
+Bulk API job yet is `cancelled`. A run that has is suspended: its job keeps
+running in Salesforce, the run stays active in the database, and the next start
+resumes it.
+
+- A resumed **export** reuses its query job and continues from the first result
+  page not yet stored. If Salesforce has deleted the job in the meantime, it
+  starts over with a new one.
+- A resumed **import** collects the outcome of each ingest job it had sent,
+  waiting for jobs still in progress. A job that was never closed is aborted and
+  its entries are sent again, as Salesforce processed none of them; if Salesforce
+  has deleted a job, its entries are dead-lettered, since their outcome is
+  unknown. Entries never uploaded are sent.
+
+A crash is treated like a shutdown, as everything a resumed run needs is stored
+before the work it describes; runs a crash leaves without a job are marked
+`failed`. A run is resumed at most three times, then failed, in case it is what
+brings the service down.
+
+### Running several instances
+
+Several instances may share one database, for availability or rolling deploys.
+Each active run is leased by the instance executing it, which renews the lease
+every 20 seconds; the lease lasts a minute. Every instance checks every 20
+seconds for runs whose lease has lapsed and takes them over: a run suspended by a
+shutdown at once, the runs of a crashed instance a minute after its last
+renewal. Every write of a run's progress checks the lease, so an instance that
+lost it, for example during a long database outage, stops the run instead of
+overwriting the work of the instance that took it over.
+
+One active run per object and direction is still enforced by the database, so
+instances never sync the same object at the same time. Each instance runs the
+cron schedule: on a tick, whichever instance comes first starts the run, and the
+others find it active and skip it. A run short enough to finish before another
+instance's tick fires may run twice, which is harmless. `MAX_CONCURRENT_JOBS`
+applies per instance.
+
+---
+
+## Monitoring
+
+`make compose-observability` starts the service with Prometheus on
+<http://localhost:9090> and Grafana on <http://localhost:3000>, which opens on a
+dashboard of runs, records, dead letters, org API usage, Salesforce responses and
+retries, and control API latency. The files work with any Prometheus and Grafana:
+
+- [`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml): alerts for a
+  down service, failing runs, new dead letters, high org API usage, and frequent
+  Salesforce retries.
+- [`deploy/grafana/dashboards/data-sync-service.json`](deploy/grafana/dashboards/data-sync-service.json):
+  the dashboard, with a data source picker for importing it elsewhere.
+
+[docs/demo.md](docs/demo.md) walks through every feature against a Developer
+Edition org.
 
 ---
 
@@ -332,7 +427,7 @@ value at once.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `HTTP_ADDR` | `:8080` | Control API listen address |
-| `SHUTDOWN_TIMEOUT` | `15s` | How long in-flight requests and cancelled runs may take to stop after `SIGINT`/`SIGTERM`; a Go duration, must be positive |
+| `SHUTDOWN_TIMEOUT` | `15s` | How long in-flight requests and active runs may take to stop after `SIGINT`/`SIGTERM`; a Go duration, must be positive |
 | `SF_CLIENT_ID` | — | **Required.** Connected app consumer key |
 | `SF_CLIENT_SECRET` | — | **Required.** Connected app consumer secret |
 | `SF_LOGIN_URL` | — | **Required.** The org's My Domain URL, e.g. `https://example.my.salesforce.com`; must be `https` |
@@ -341,7 +436,8 @@ value at once.
 | `DATABASE_URL` | — | **Required.** Postgres DSN; the connection pool is raised to at least `MAX_CONCURRENT_JOBS × WORKER_COUNT + 4` connections |
 | `SYNC_OBJECTS` | — | Objects and schedules, e.g. `Account:*/15 * * * *,Contact:0 * * * *` (see below) |
 | `MAX_CONCURRENT_JOBS` | `4` | Runs executing at once; further runs wait queued. At least 1 |
-| `API_RATE_LIMIT` | `10` | Request-per-second ceiling; at least 1. Not enforced yet (milestone 6) |
+| `API_RATE_LIMIT` | `10` | Salesforce requests per second, retries and polling included; at least 1 |
+| `API_USAGE_THRESHOLD` | `80` | Percentage of the org's daily API requests above which no new run starts; 0 to 100, where 0 turns the check off |
 | `WORKER_COUNT` | `4` | Upsert workers per run; at least 1 |
 | `IMPORT_MAX_RECORDS` | `10000` | Outbox entries one import run sends at most; at least 1 |
 | `IMPORT_MAX_ATTEMPTS` | `5` | Import runs that may try an outbox entry before it is dead-lettered; at least 1 |
@@ -370,8 +466,11 @@ entries, an import.
 | 3 — Export pipeline | Bulk API query jobs, CSV streaming, Postgres upsert, run records | Done |
 | 4 — Incremental sync | `SystemModstamp` watermarks, scheduled runs | Done |
 | 5 — Import + dead letter | Outbox-driven Bulk API ingest jobs, retries with backoff, dead letters | Done |
-| 6 — Resilience | Rate limiting, API-limit tracking, resumable runs | Planned |
-| 7 — Tests and polish | Failure-injection tests, metrics dashboard, architecture docs | Planned |
+| 6 — Resilience | Rate limiting, API-limit tracking, resumable runs | Done |
+| 7 — Tests and polish | Failure-injection tests, metrics dashboard, architecture docs | Done |
+
+Possible next steps: PK chunking for very large query jobs, typed views over
+`sf_records`, and reconciling hard-deleted records.
 
 ---
 
@@ -384,11 +483,13 @@ internal/
   config/             environment configuration loader and validation
   logging/            zap logger constructor
   retry/              exponential backoff with jitter, Retry-After parsing
-  salesforce/         OAuth token provider, REST client, describe, Bulk API query and ingest jobs
+  salesforce/         OAuth token provider, rate-limited REST client, API usage, describe, Bulk API jobs
   salesforce/sftest/  in-process fake Salesforce org for tests
-  store/              Postgres access: migrations, runs, watermarks, record upserts, outbox
+  store/              Postgres access: migrations, runs, checkpoints, watermarks, record upserts, outbox
   store/storetest/    throwaway migrated databases for tests
-  syncer/             run orchestration, scheduling, and the export and import pipelines
+  syncer/             run orchestration, scheduling, resumption, and the export and import pipelines
+deploy/               Prometheus configuration and alerts, Grafana dashboard and provisioning
+docs/                 architecture and demo walkthrough
 scripts/hooks/        git pre-commit hook
 .github/workflows/    CI, CodeQL, and the tag-triggered release
 .goreleaser.yaml      release binaries and checksums
@@ -410,6 +511,7 @@ make vuln            # govulncheck against dependencies and the standard library
 make install-hooks   # pre-commit hook running lint and tests
 make docker-build    # build the container image
 make compose-app     # run the service and Postgres in containers
+make compose-observability  # the same plus Prometheus and Grafana
 ```
 
 Tests that need PostgreSQL start a container through testcontainers, so they need

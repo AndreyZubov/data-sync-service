@@ -152,12 +152,15 @@ func (c *Client) waitForJob(
 }
 
 // StreamQueryResults downloads the results of a completed query job page by
-// page and calls page with each page's CSV body, header row included. Pages
+// page, starting at the page the locator from names ("" for the first), and
+// calls page with each page's CSV body, header row included, and the locator
+// of the page after it ("" after the last page). A caller that remembers the
+// locators of the pages it has processed can resume a download later. Pages
 // are read straight from the network, so memory use does not grow with the
 // result size. Iteration stops at the first error page returns.
-func (c *Client) StreamQueryResults(ctx context.Context, id string, page func(csv io.Reader) error) error {
+func (c *Client) StreamQueryResults(ctx context.Context, id, from string, page func(csv io.Reader, next string) error) error {
 	path := "/jobs/query/" + url.PathEscape(id) + "/results"
-	locator := ""
+	locator := from
 	for {
 		req := Request{Method: http.MethodGet, Path: path, Header: http.Header{"Accept": {"text/csv"}}}
 		if locator != "" {
@@ -167,16 +170,15 @@ func (c *Client) StreamQueryResults(ctx context.Context, id string, page func(cs
 		if err != nil {
 			return fmt.Errorf("get results of query job %s: %w", id, err)
 		}
-		err = page(resp.Body)
-		_ = resp.Body.Close()
-		if err != nil {
-			return err
-		}
-
 		// Salesforce sends the literal string "null" after the last page.
 		locator = resp.Header.Get("Sforce-Locator")
-		if locator == "" || locator == "null" {
-			return nil
+		if locator == "null" {
+			locator = ""
+		}
+		err = page(resp.Body, locator)
+		_ = resp.Body.Close()
+		if err != nil || locator == "" {
+			return err
 		}
 	}
 }

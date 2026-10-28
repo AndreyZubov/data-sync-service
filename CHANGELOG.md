@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Resumable runs: a run that already has a Bulk API job is suspended on
+  shutdown, with the job left running, and resumed at the next start, as is one
+  interrupted by a crash. Exports continue from the last result page committed
+  to the database; imports collect the outcomes of the ingest jobs they had
+  sent instead of sending the entries again. A run is resumed at most three
+  times. `GET /runs/{id}` reports `resumes`.
+- Outbox entries keep their ingest job until their outcome is known, so the
+  next run collects the outcome of a run that failed after closing a job
+  instead of uploading the entries again: inserts are no longer duplicated.
+- Several instances can share a database: every active run is leased by the
+  instance executing it, renewed every 20 seconds, and taken over by another
+  instance once the lease lapses. Writes of a run's state are fenced by the
+  lease.
+- `go.mod` requires the Go 1.26.10 toolchain, which fixes standard library
+  vulnerabilities reported by `govulncheck`.
+- `API_RATE_LIMIT` is enforced: Salesforce requests, retries and polling
+  included, go through a token bucket.
+- Org API usage tracking: the `Sforce-Limit-Info` figures of every response are
+  exported as `salesforce_api_usage_requests` and `salesforce_api_usage_limit`,
+  and no new run starts while usage is above `API_USAGE_THRESHOLD` (80% by
+  default); the control API answers `503` with `Retry-After`.
+- `salesforce_requests_total`, `salesforce_request_retries_total`, and
+  `sync_runs_resumed_total` metrics.
+- Prometheus alert rules, a Grafana dashboard, and `make compose-observability`
+  to run both next to the service.
+- Architecture documentation with diagrams, and a demo walkthrough.
+- Failure-injection tests that stop the service in the middle of exports and
+  imports and check that a new instance finishes them.
+
 - Import pipeline: changes that other systems insert into the `sf_outbox` table
   (`insert`, `update`, `upsert` by external ID, or `delete`) are sent to Salesforce
   through Bulk API 2.0 ingest jobs by `POST /sync/{object}/import` and on every
@@ -35,8 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Run records: `GET /runs/{id}` reports status, trigger, record count, Bulk API
   job ID, timestamps, and errors. One export per object runs at a time (`409
   Conflict` otherwise), and at most `MAX_CONCURRENT_JOBS` run at once.
-- Graceful shutdown cancels active runs and aborts their Salesforce jobs; runs
-  interrupted by a crash are marked failed at startup.
+- Graceful shutdown stops the schedule and active runs; runs interrupted by a
+  crash before they had a Salesforce job are marked failed at startup.
 - PostgreSQL schema migrations, embedded and applied at startup.
 - `/readyz` checks the database as well as Salesforce authentication.
 - `sync_runs_total`, `sync_records_total`, `sync_run_duration_seconds`, and
