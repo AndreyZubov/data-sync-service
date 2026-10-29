@@ -260,6 +260,23 @@ sequenceDiagram
     A-->>DB: late checkpoint write (refused: not the owner)
 ```
 
+### Failures at a glance
+
+| Failure | Effect | Recovery |
+|---------|--------|----------|
+| Transient `5xx`, `429`, network error | Request retried with backoff | Automatic |
+| Export fails part-way (Salesforce or database) | Run `failed`; committed records kept, watermark unchanged | Next run re-reads from the old watermark |
+| Import fails before Salesforce processes the job | Job aborted; entries back to `pending`, attempt not counted | Next run sends them |
+| Import fails after closing its job | Entries back to `pending` with their job, attempt not counted | Next run collects the outcome from the job |
+| Ingest job deleted before its outcome was read | Entries dead-lettered, as their outcome is unknown | Operator checks the records and requeues |
+| Records rejected by Salesforce | Retried after 1 min, doubling up to 1 h | Dead-lettered after `IMPORT_MAX_ATTEMPTS` |
+| `REQUEST_LIMIT_EXCEEDED` | Request not retried; run `failed` | New runs wait until usage drops below `API_USAGE_THRESHOLD` |
+| Token endpoint unavailable | Run `failed`; `/readyz` reports `fail` | Next run |
+| Service stopped or crashed mid-run | Run suspended; Bulk API job keeps going | Resumed at next start or by a peer |
+
+`internal/syncer/failure_test.go` and `resume_test.go` reproduce each of these
+against the fake org and a real PostgreSQL database.
+
 ## Design decisions
 
 **One generic JSONB table for records.** `sf_records` stores every object as
@@ -286,6 +303,7 @@ cron runs on every instance; a duplicate start is refused by the index.
 
 **A fake org instead of mocks.** `sftest` implements the token endpoint,
 describe, and the Bulk API job lifecycles over real HTTPS, so tests exercise
-the real client, retries, pagination, and CSV handling. Failure-injection tests
-stop the service mid-run against it and check that a new instance finishes the
-run without losing or repeating work.
+the real client, retries, pagination, and CSV handling. `InjectFault` makes it
+answer chosen requests with errors, so failure-injection tests can break a run
+at any step, or stop the service mid-run, and check that the next run finishes
+the work without losing or repeating any of it.

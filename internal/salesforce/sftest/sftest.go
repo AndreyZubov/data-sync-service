@@ -38,6 +38,7 @@ type Server struct {
 
 	apiUsed, apiMax int
 	intercept       func(w http.ResponseWriter, r *http.Request) bool
+	faults          []*fault
 
 	describes  map[string]Describe
 	onQuery    QueryFunc
@@ -125,6 +126,87 @@ func (s *Server) Intercept(fn func(w http.ResponseWriter, r *http.Request) bool)
 	s.intercept = fn
 }
 
+// Fault makes the org answer matching data API requests with an error
+// instead of handling them, to test how clients cope with failures.
+type Fault struct {
+	// Method and PathSuffix select requests: the method must match, and the
+	// path, relative to /services/data/vXX.X, must end in PathSuffix, e.g.
+	// "/results" or "/batches".
+	Method     string
+	PathSuffix string
+	// Skip lets that many matching requests through before the fault starts.
+	Skip int
+	// Times is how many requests fail once the fault has started; zero means
+	// every one.
+	Times int
+	// Status and Code form the error response, a Salesforce-style error body.
+	Status int
+	Code   string
+	// RetryAfter, when set, is sent as the Retry-After header.
+	RetryAfter string
+}
+
+type fault struct {
+	Fault
+	seen, failed int
+}
+
+// InjectFault adds f. Faults are checked in the order they were added, after
+// any Intercept function, and the first one whose turn it is answers the
+// request.
+func (s *Server) InjectFault(f Fault) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.faults = append(s.faults, &fault{Fault: f})
+}
+
+// ClearFaults removes every injected fault.
+func (s *Server) ClearFaults() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.faults = nil
+}
+
+// FaultsTriggered returns how many requests injected faults have answered.
+func (s *Server) FaultsTriggered() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, f := range s.faults {
+		n += f.failed
+	}
+	return n
+}
+
+// answerFault answers r with the first injected fault whose turn it is and
+// reports whether it did.
+func (s *Server) answerFault(w http.ResponseWriter, r *http.Request) bool {
+	path := strings.TrimPrefix(r.URL.Path, "/services/data/v"+APIVersion)
+	s.mu.Lock()
+	var match *fault
+	for _, f := range s.faults {
+		if f.Method != r.Method || !strings.HasSuffix(path, f.PathSuffix) {
+			continue
+		}
+		f.seen++
+		if f.seen <= f.Skip || (f.Times > 0 && f.failed >= f.Times) {
+			continue
+		}
+		f.failed++
+		match = f
+		break
+	}
+	s.mu.Unlock()
+	if match == nil {
+		return false
+	}
+	if match.RetryAfter != "" {
+		w.Header().Set("Retry-After", match.RetryAfter)
+	}
+	WriteError(w, match.Status, match.Code, "injected fault")
+	return true
+}
+
 // TokenRequests returns how many token requests the org has received.
 func (s *Server) TokenRequests() int {
 	s.mu.Lock()
@@ -206,6 +288,9 @@ func (s *Server) requireToken(h http.HandlerFunc) http.HandlerFunc {
 		intercept := s.intercept
 		s.mu.Unlock()
 		if intercept != nil && intercept(w, r) {
+			return
+		}
+		if s.answerFault(w, r) {
 			return
 		}
 		h(w, r)

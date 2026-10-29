@@ -211,6 +211,7 @@ successful health and metrics probes at `debug`, everything else at `info`.
 | `sync_run_duration_seconds` | `object`, `direction` | Run duration, excluding time queued |
 | `sync_active_runs` | — | Runs currently executing |
 | `sync_runs_resumed_total` | `object`, `direction` | Runs resumed after a restart |
+| `sync_last_success_timestamp_seconds` | `object`, `direction` | Unix time the last successful run finished, since the service started |
 | `salesforce_requests_total` | `code` | Salesforce data API responses by HTTP status; `error` when none arrived |
 | `salesforce_request_retries_total` | `reason` | Salesforce requests resent, by the status code or `error` that caused it |
 | `salesforce_api_usage_requests` | — | API requests the org has used in the rolling 24 hours, as last reported |
@@ -408,8 +409,10 @@ dashboard of runs, records, dead letters, org API usage, Salesforce responses an
 retries, and control API latency. The files work with any Prometheus and Grafana:
 
 - [`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml): alerts for a
-  down service, failing runs, new dead letters, high org API usage, and frequent
-  Salesforce retries.
+  down service, failing runs, exports that have not succeeded for six hours, new
+  dead letters, high org API usage, and frequent Salesforce retries.
+  `make check-alerts` validates the rules and runs their unit tests in
+  [`alerts_test.yml`](deploy/prometheus/alerts_test.yml).
 - [`deploy/grafana/dashboards/data-sync-service.json`](deploy/grafana/dashboards/data-sync-service.json):
   the dashboard, with a data source picker for importing it elsewhere.
 
@@ -508,6 +511,7 @@ make lint            # go vet + golangci-lint (via Docker)
 make fmt             # gofumpt + gci import ordering
 make config-verify   # validate .golangci.yml against the linter schema
 make vuln            # govulncheck against dependencies and the standard library
+make check-alerts    # promtool: validate and unit-test the alerting rules (via Docker)
 make install-hooks   # pre-commit hook running lint and tests
 make docker-build    # build the container image
 make compose-app     # run the service and Postgres in containers
@@ -519,13 +523,19 @@ Docker. To use an existing server instead, set `TEST_DATABASE_URL` to a DSN whos
 role may create databases; every test gets a fresh database. Without either, those
 tests are skipped locally; in CI they fail instead.
 
+Salesforce is replaced by the in-process fake org in `internal/salesforce/sftest`,
+which serves the real HTTPS endpoints. Its `InjectFault` answers chosen requests
+with errors, which `internal/syncer/failure_test.go` uses to break runs at every
+step and check that the next run picks up cleanly.
+
 `golangci-lint` runs from a pinned Docker image, so no local installation is
 needed and CI uses the same build. Linters enabled include `errcheck`, `gosec`,
 `revive`, `staticcheck`, `errorlint`, `bodyclose`, `contextcheck`, and `nilerr`;
 formatting is `gofumpt` plus `gci` import grouping.
 
 CI runs lint, a `go mod tidy` cleanliness check, tests under the race detector
-with a coverage summary, `govulncheck`, and a Docker image build; CodeQL analyses
+with a coverage summary, `govulncheck`, the alerting rule tests, and a Docker
+image build; CodeQL analyses
 every push and pull request. Actions are pinned to commit SHAs, and Dependabot keeps
 them current.
 

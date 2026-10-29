@@ -105,6 +105,15 @@ jobs:
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }} ./...
 
+  alerts:
+    name: Alerting rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check rules and run their unit tests
+        run: make check-alerts
+
   docker:
     name: Docker image
     runs-on: ubuntu-latest

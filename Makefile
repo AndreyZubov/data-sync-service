@@ -13,6 +13,10 @@ GOLANGCI := docker run --rm -v "$(CURDIR)":/app -w /app golangci/golangci-lint:$
 # Pinned so local runs and CI report the same vulnerability findings.
 GOVULNCHECK_VERSION ?= v1.9.0
 
+# Same image as the observability stack in docker-compose.yml.
+PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0
+PROMTOOL := docker run --rm -v "$(CURDIR)/deploy/prometheus":/rules -w /rules --entrypoint promtool $(PROMETHEUS_IMAGE)
+
 # Version stamped into the binary at build time.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
@@ -57,6 +61,11 @@ config-verify: ## Validate .golangci.yml against the linter's schema
 .PHONY: vuln
 vuln: ## Scan dependencies and the standard library for known vulnerabilities
 	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+
+.PHONY: check-alerts
+check-alerts: ## Validate the Prometheus alerting rules and run their unit tests (via Docker)
+	$(PROMTOOL) check rules alerts.yml
+	$(PROMTOOL) test rules alerts_test.yml
 
 .PHONY: tidy
 tidy: ## Tidy go.mod / go.sum

@@ -30,13 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exported as `salesforce_api_usage_requests` and `salesforce_api_usage_limit`,
   and no new run starts while usage is above `API_USAGE_THRESHOLD` (80% by
   default); the control API answers `503` with `Retry-After`.
-- `salesforce_requests_total`, `salesforce_request_retries_total`, and
-  `sync_runs_resumed_total` metrics.
-- Prometheus alert rules, a Grafana dashboard, and `make compose-observability`
-  to run both next to the service.
+- `salesforce_requests_total`, `salesforce_request_retries_total`,
+  `sync_runs_resumed_total`, and `sync_last_success_timestamp_seconds` metrics.
+- Prometheus alert rules, including one for exports that have not succeeded for
+  six hours, with unit tests run by `make check-alerts` and CI; a Grafana
+  dashboard; and `make compose-observability` to run both next to the service.
 - Architecture documentation with diagrams, and a demo walkthrough.
 - Failure-injection tests that stop the service in the middle of exports and
-  imports and check that a new instance finishes them.
+  imports and check that a new instance finishes them, and tests that make the
+  fake org fail chosen requests (`sftest.InjectFault`) or the database refuse
+  writes part-way through a run.
 
 - Import pipeline: changes that other systems insert into the `sf_outbox` table
   (`insert`, `update`, `upsert` by external ID, or `delete`) are sent to Salesforce
