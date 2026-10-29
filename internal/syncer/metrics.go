@@ -12,6 +12,7 @@ type metrics struct {
 	duration    *prometheus.HistogramVec
 	active      prometheus.Gauge
 	resumed     *prometheus.CounterVec
+	lastSuccess *prometheus.GaugeVec
 }
 
 func newMetrics(reg prometheus.Registerer) *metrics {
@@ -46,7 +47,11 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Name: "sync_runs_resumed_total",
 			Help: "Runs resumed after a service restart, by object and direction.",
 		}, []string{"object", "direction"}),
+		lastSuccess: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sync_last_success_timestamp_seconds",
+			Help: "Unix time the last successful run of an object and direction finished, since the service started.",
+		}, []string{"object", "direction"}),
 	}
-	reg.MustRegister(m.runs, m.records, m.failures, m.deadLetters, m.duration, m.active, m.resumed)
+	reg.MustRegister(m.runs, m.records, m.failures, m.deadLetters, m.duration, m.active, m.resumed, m.lastSuccess)
 	return m
 }

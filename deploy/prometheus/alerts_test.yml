@@ -1,0 +1,116 @@
+# Unit tests for alerts.yml: make check-alerts
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'up{job="syncd", instance="syncd:8080"}'
+        values: "1 1 0 0 0 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SyncServiceDown
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: SyncServiceDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: syncd
+              instance: syncd:8080
+            exp_annotations:
+              summary: The sync service has not answered metrics scrapes for 5 minutes.
+
+  - interval: 1m
+    input_series:
+      - series: 'sync_runs_total{object="Account", direction="export", status="failed"}'
+        values: "0 0 1 1"
+      - series: 'sync_runs_total{object="Contact", direction="import", status="succeeded"}'
+        values: "0 1 2 3"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SyncRunsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              object: Account
+              direction: export
+            exp_annotations:
+              summary: "export runs of Account failed in the last hour."
+              description: "GET /runs/{id} shows the error of each run; the service log has the details."
+
+  - interval: 1m
+    input_series:
+      # The last success was at t=0, and the gauge keeps reporting it.
+      - series: 'sync_last_success_timestamp_seconds{object="Account", direction="export"}'
+        values: "0x600"
+    alert_rule_test:
+      - eval_time: 6h
+        alertname: SyncExportStale
+        exp_alerts: []
+      - eval_time: 7h
+        alertname: SyncExportStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              object: Account
+              direction: export
+            exp_annotations:
+              summary: "Account has not been exported successfully for over 6 hours."
+              description: "The PostgreSQL copy of the object is falling behind Salesforce; check the failed runs and the schedule."
+
+  - interval: 1m
+    input_series:
+      - series: 'sync_dead_letters_total{object="Contact"}'
+        values: "0 0 2 2"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SyncDeadLetters
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              object: Contact
+            exp_annotations:
+              summary: "Outbox entries of Contact were dead-lettered in the last hour."
+              description: "GET /sync/{object}/dead-letters lists them; fix the cause and POST /sync/{object}/dead-letters/retry."
+
+  - interval: 1m
+    input_series:
+      - series: "salesforce_api_usage_requests"
+        values: "9000 12000x20"
+      - series: "salesforce_api_usage_limit"
+        values: "15000x20"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SalesforceAPIUsageHigh
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: SalesforceAPIUsageHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "The org has used 80% of its daily API requests."
+              description: "The allocation is shared by every integration of the org; runs pause above API_USAGE_THRESHOLD."
+
+  - interval: 1m
+    input_series:
+      # 2 of every 10 requests are retried.
+      - series: 'salesforce_request_retries_total{reason="503"}'
+        values: "0+120x40"
+      - series: 'salesforce_requests_total{code="200"}'
+        values: "0+600x40"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SalesforceRetriesHigh
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: SalesforceRetriesHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: More than 10% of Salesforce requests are being retried.
+              description: "salesforce_request_retries_total shows the status codes behind them; 429 and 503 mean the org is throttling."

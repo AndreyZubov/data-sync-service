@@ -21,8 +21,9 @@ dist/
 coverage.out
 coverage.html
 
-# Docs and compose (not needed in the image build context)
+# Docs, compose, and monitoring config (not needed in the image build context)
 docs/
+deploy/
 README.md
 CHANGELOG.md
 CONTRIBUTING.md

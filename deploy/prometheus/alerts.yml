@@ -17,6 +17,17 @@ groups:
           summary: "{{ $labels.direction }} runs of {{ $labels.object }} failed in the last hour."
           description: GET /runs/{id} shows the error of each run; the service log has the details.
 
+      # The gauge starts empty after a restart, so this only covers exports
+      # that have succeeded at least once since the service started.
+      - alert: SyncExportStale
+        expr: time() - sync_last_success_timestamp_seconds{direction="export"} > 6 * 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.object }} has not been exported successfully for over 6 hours."
+          description: The PostgreSQL copy of the object is falling behind Salesforce; check the failed runs and the schedule.
+
       - alert: SyncDeadLetters
         expr: sum by (object) (increase(sync_dead_letters_total[1h])) > 0
         labels:

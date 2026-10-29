@@ -164,6 +164,8 @@ func TestExportLoadsEveryRecordAndAdvancesTheWatermark(t *testing.T) {
 
 	assert.InDelta(t, 5, testutil.ToFloat64(e.orch.metrics.records.WithLabelValues("Account", "export")), 0)
 	assert.InDelta(t, 1, testutil.ToFloat64(e.orch.metrics.runs.WithLabelValues("Account", "export", "succeeded")), 0)
+	lastSuccess := testutil.ToFloat64(e.orch.metrics.lastSuccess.WithLabelValues("Account", "export"))
+	assert.InDelta(t, float64(time.Now().Unix()), lastSuccess, 60)
 }
 
 func TestSecondExportIsIncremental(t *testing.T) {

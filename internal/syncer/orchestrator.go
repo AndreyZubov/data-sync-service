@@ -528,6 +528,7 @@ func (o *Orchestrator) execute(ctx context.Context, run store.Run, w work) {
 	switch {
 	case err == nil:
 		o.metrics.runs.WithLabelValues(run.Object, string(run.Direction), string(store.Succeeded)).Inc()
+		o.metrics.lastSuccess.WithLabelValues(run.Object, string(run.Direction)).SetToCurrentTime()
 		log.Info("run succeeded", zap.Duration("duration", time.Since(start)))
 	case ctx.Err() != nil:
 		o.stop(ctx, run, err, log)
