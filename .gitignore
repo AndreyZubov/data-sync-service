@@ -30,6 +30,6 @@ vendor/
 # Internal working docs (specs, plans, notes — not for the public repo)
 docs/internal/
 
-# Claude Code local context and settings (personal, not for the public repo)
+# Claude Code local context and settings (not for the public repo)
 CLAUDE.local.md
 .claude/
