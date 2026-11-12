@@ -12,8 +12,8 @@ Please **do not open a public issue** for a security problem.
 Report it privately through GitHub's
 [private vulnerability reporting](https://github.com/AndreyZubov/data-sync-service/security/advisories/new)
 on this repository. Include what you found, how to reproduce it, and the impact
-you expect. You will get an acknowledgement within a few days; since this is a
-personal project maintained in spare time, a fix may take longer than that.
+you expect. You will get an acknowledgement within a few days; a fix may take
+longer than that.
 
 ## Scope
 

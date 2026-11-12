@@ -9,9 +9,8 @@
 > jobs, manages async job lifecycles, respects org API limits, and recovers cleanly
 > from failures.
 
-**Status:** feature-complete for the planned scope; not yet tried against a wide
-range of production orgs. The service authenticates with OAuth client
-credentials. It exports configured objects into PostgreSQL through Bulk API 2.0
+**Status:** feature-complete for the planned scope. The service authenticates
+with OAuth client credentials. It exports configured objects into PostgreSQL through Bulk API 2.0
 query jobs, streaming results with flat memory use and syncing incrementally from
 `SystemModstamp` watermarks. It imports changes that other systems write to an
 outbox table through Bulk API 2.0 ingest jobs, retrying failed records and
@@ -26,9 +25,9 @@ restart or crash resumes from its Salesforce job instead of starting over.
 
 Keeping Salesforce data in sync with a downstream store is one of the most common
 reasons companies put Go next to a CRM: it is fast, concurrent, and cheap to run.
-A bulk sync service also touches the parts of backend engineering that are worth
-demonstrating properly — HTTP API clients, asynchronous job orchestration, worker
-pools, database work, retries, and rate limiting — rather than a CRUD app.
+Doing it reliably at volume is mostly a matter of the unglamorous parts:
+asynchronous job orchestration, streaming with flat memory use, retries, rate
+limiting within the org's API allowance, and recovery from a restart mid-run.
 
 A companion project, [pubsub-event-processor](https://github.com/AndreyZubov/pubsub-event-processor),
 covers the real-time half of the same problem via the Salesforce Pub/Sub API.
@@ -473,7 +472,8 @@ entries, an import.
 | 7 — Tests and polish | Failure-injection tests, metrics dashboard, architecture docs | Done |
 
 Possible next steps: PK chunking for very large query jobs, typed views over
-`sf_records`, and reconciling hard-deleted records.
+`sf_records`, reconciling hard-deleted records, and validation against a wider
+range of production orgs.
 
 ---
 

@@ -1,7 +1,7 @@
 # Contributing
 
-Thanks for taking a look. This is a personal portfolio project, so the scope is
-deliberately narrow — but issues, questions, and pull requests are welcome.
+Thanks for taking a look. The scope is deliberately narrow, but issues,
+questions, and pull requests are welcome.
 
 ## Getting set up
 
